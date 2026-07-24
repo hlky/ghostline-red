@@ -1153,8 +1153,14 @@ fn collect_redpackage_overrides(
                 let data = object
                     .get("Data")
                     .ok_or_else(|| unsupported("RedPackage Data"))?;
-                let template_package =
-                    uncompressed_template_buffer(file, template, index, kraken_path)?;
+                let (index, template_package) = resolve_redpackage_template_buffer(
+                    file,
+                    template,
+                    index,
+                    data,
+                    classes,
+                    kraken_path,
+                )?;
                 let imports_as_hash = redpackage::imports_are_hashed(&template_package)?;
                 let bytes = redpackage::encode_with_template(
                     &template_package,
@@ -1182,6 +1188,59 @@ fn collect_redpackage_overrides(
         _ => {}
     }
     Ok(())
+}
+
+fn resolve_redpackage_template_buffer(
+    file: &Cr2wInspection,
+    template: &[u8],
+    requested_index: usize,
+    data: &Value,
+    classes: &BTreeSet<String>,
+    kraken_path: &OsStr,
+) -> Result<(usize, Vec<u8>), WriterError> {
+    let expected_roots = redpackage_root_types(data);
+    let mut matches = Vec::new();
+    for index in 0..file.buffers.len() {
+        let Ok(bytes) = uncompressed_template_buffer(file, template, index, kraken_path) else {
+            continue;
+        };
+        let Ok(imports_as_hash) = redpackage::imports_are_hashed(&bytes) else {
+            continue;
+        };
+        let Ok(decoded) = redpackage::decode(
+            &bytes,
+            classes,
+            PackageSettings {
+                imports_as_hash,
+                handle_id_base: 0,
+            },
+        ) else {
+            continue;
+        };
+        if redpackage_root_types(&decoded) == expected_roots {
+            matches.push((index, bytes));
+        }
+    }
+    if let Some(position) = matches
+        .iter()
+        .position(|(index, _)| *index == requested_index)
+    {
+        return Ok(matches.swap_remove(position));
+    }
+    match matches.as_mut_slice() {
+        [candidate] => Ok((candidate.0, std::mem::take(&mut candidate.1))),
+        [] => Err(unsupported("RedPackage template buffer not found")),
+        _ => Err(unsupported("RedPackage template buffer is ambiguous")),
+    }
+}
+
+fn redpackage_root_types(data: &Value) -> Vec<&str> {
+    data.get("Chunks")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|chunk| chunk.get("$type").and_then(Value::as_str))
+        .collect()
 }
 
 fn uncompressed_template_buffer(
@@ -1548,6 +1607,7 @@ fn unsupported(message: impl Into<String>) -> WriterError {
 mod tests {
     use super::write_with_template;
     use crate::{codec, schema};
+    use serde_json::Value;
     use std::{
         collections::{BTreeSet, HashMap},
         env,
@@ -1609,5 +1669,139 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(replacement.as_str())
         );
+    }
+
+    #[test]
+    #[ignore = "real RedPackage fixture; requires REDPACKAGE_JSON, REDPACKAGE_TEMPLATE, and RED_SCHEMA"]
+    fn redpackage_fixture_resolves_buffer_identity_and_preserves_device_state() {
+        let json_path = env::var_os("REDPACKAGE_JSON").map(PathBuf::from).unwrap();
+        let fixture = env::var_os("REDPACKAGE_TEMPLATE")
+            .map(PathBuf::from)
+            .unwrap();
+        let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
+        let classes: HashMap<String, schema::RedClass> =
+            serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
+        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let workspace = tempfile::tempdir().unwrap();
+        let output_path = workspace.path().join("redpackage.streamingsector");
+        let missing_dll = OsStr::new("missing-kraken.dll");
+
+        write_with_template(
+            &json_path,
+            &fixture,
+            &output_path,
+            &class_names,
+            missing_dll,
+        )
+        .unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        let json = serde_json::to_string(&decoded).unwrap();
+        for expected in [
+            "ComputerControllerPS",
+            "filesStructure",
+            "SIGNAL DELAY",
+            "gqt001_document_read",
+            "onscreens/emails/quests/minor_quest/gqt001/files/diagnostic",
+        ] {
+            assert!(json.contains(expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    #[ignore = "real RedPackage fixture; requires REDPACKAGE_JSON, REDPACKAGE_TEMPLATE, and RED_SCHEMA"]
+    fn redpackage_fixture_grows_array_and_adds_nested_handle() {
+        let source_path = env::var_os("REDPACKAGE_JSON").map(PathBuf::from).unwrap();
+        let fixture = env::var_os("REDPACKAGE_TEMPLATE")
+            .map(PathBuf::from)
+            .unwrap();
+        let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
+        let classes: HashMap<String, schema::RedClass> =
+            serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
+        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let workspace = tempfile::tempdir().unwrap();
+        let json_path = workspace.path().join("grown.json");
+        let output_path = workspace.path().join("grown.streamingsector");
+        let missing_dll = OsStr::new("missing-kraken.dll");
+        let mut document: Value = serde_json::from_slice(&fs::read(source_path).unwrap()).unwrap();
+
+        assert!(grow_files_structure(&mut document));
+        fs::write(&json_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        write_with_template(
+            &json_path,
+            &fixture,
+            &output_path,
+            &class_names,
+            missing_dll,
+        )
+        .unwrap();
+
+        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        assert!(
+            serde_json::to_string(&decoded)
+                .unwrap()
+                .contains("REDPACKAGE_GROWTH_TEST")
+        );
+        assert!(has_files_structure_length(&decoded, 2));
+    }
+
+    fn grow_files_structure(value: &mut Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                if let Some(Value::Array(files)) = object.get_mut("filesStructure")
+                    && files.len() == 1
+                    && serde_json::to_string(&files[0])
+                        .is_ok_and(|json| json.contains("gameJournalPath"))
+                {
+                    let mut added = files[0].clone();
+                    assert!(rewrite_journal_handle(&mut added));
+                    if let Some(content) = added.pointer_mut("/content/0/content") {
+                        let original = content.as_str().unwrap().to_owned();
+                        *content = Value::String(format!("{original}\nREDPACKAGE_GROWTH_TEST"));
+                    }
+                    files.push(added);
+                    return true;
+                }
+                object.values_mut().any(grow_files_structure)
+            }
+            Value::Array(values) => values.iter_mut().any(grow_files_structure),
+            _ => false,
+        }
+    }
+
+    fn rewrite_journal_handle(value: &mut Value) -> bool {
+        match value {
+            Value::Object(object) => {
+                if object
+                    .get("Data")
+                    .and_then(|data| data.get("$type"))
+                    .and_then(Value::as_str)
+                    == Some("gameJournalPath")
+                {
+                    object.insert("HandleId".to_owned(), Value::String("999999".to_owned()));
+                    return true;
+                }
+                object.values_mut().any(rewrite_journal_handle)
+            }
+            Value::Array(values) => values.iter_mut().any(rewrite_journal_handle),
+            _ => false,
+        }
+    }
+
+    fn has_files_structure_length(value: &Value, minimum: usize) -> bool {
+        match value {
+            Value::Object(object) => {
+                object
+                    .get("filesStructure")
+                    .and_then(Value::as_array)
+                    .is_some_and(|files| files.len() >= minimum)
+                    || object
+                        .values()
+                        .any(|value| has_files_structure_length(value, minimum))
+            }
+            Value::Array(values) => values
+                .iter()
+                .any(|value| has_files_structure_length(value, minimum)),
+            _ => false,
+        }
     }
 }

@@ -4,7 +4,7 @@ use crate::archive;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap, HashSet},
 };
 use thiserror::Error;
@@ -65,6 +65,11 @@ struct Encoder<'a> {
     imports: RefCell<HashMap<(String, bool), i16>>,
     new_imports: RefCell<Vec<Import>>,
     chunks: RefCell<HashMap<usize, &'a Value>>,
+    chunk_templates: RefCell<Vec<usize>>,
+    class_templates: HashMap<String, usize>,
+    handle_ids: RefCell<HashMap<String, usize>>,
+    claimed_chunks: RefCell<HashSet<usize>>,
+    discovering: Cell<bool>,
     imports_as_hash: bool,
 }
 
@@ -275,34 +280,55 @@ pub fn encode_with_template(
                 .zip(roots)
                 .collect::<HashMap<_, _>>(),
         ),
+        chunk_templates: RefCell::new((0..layout.layout.chunks.len()).collect()),
+        class_templates: layout
+            .layout
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(index, &(type_index, start))| {
+                Ok((template_reader.name(type_index, start)?.to_owned(), index))
+            })
+            .collect::<Result<HashMap<_, _>, PackageError>>()?,
+        handle_ids: RefCell::new(HashMap::new()),
+        claimed_chunks: RefCell::new(root_indices.iter().copied().collect()),
+        discovering: Cell::new(true),
         imports_as_hash: settings.imports_as_hash,
     };
 
     // Discovery interns names/imports and follows template handle pointers.
-    for index in 0..layout.layout.chunks.len() {
+    let mut index = 0;
+    loop {
+        let Some(template_index) = encoder.chunk_templates.borrow().get(index).copied() else {
+            break;
+        };
         let value = { encoder.chunks.borrow().get(&index).copied() };
         let Some(value) = value else {
+            index += 1;
             continue;
         };
-        let (type_index, start) = layout.layout.chunks[index];
+        let (type_index, start) = layout.layout.chunks[template_index];
         let end = layout
             .layout
             .chunks
-            .get(index + 1)
+            .get(template_index + 1)
             .map_or(template.len(), |(_, next)| *next);
         let class_name = encoder.reader.name(type_index, start)?;
         let _ = encoder.encode_class(value, class_name, start, end)?;
+        index += 1;
     }
+    encoder.discovering.set(false);
 
     let mut chunk_data = Vec::new();
-    let mut chunk_offsets = Vec::with_capacity(layout.layout.chunks.len());
-    for index in 0..layout.layout.chunks.len() {
+    let chunk_templates = encoder.chunk_templates.borrow().clone();
+    let mut chunk_offsets = Vec::with_capacity(chunk_templates.len());
+    for (index, &template_index) in chunk_templates.iter().enumerate() {
         chunk_offsets.push(chunk_data.len());
-        let (type_index, start) = layout.layout.chunks[index];
+        let (type_index, start) = layout.layout.chunks[template_index];
         let end = layout
             .layout
             .chunks
-            .get(index + 1)
+            .get(template_index + 1)
             .map_or(template.len(), |(_, next)| *next);
         let value = { encoder.chunks.borrow().get(&index).copied() };
         if let Some(value) = value {
@@ -318,9 +344,9 @@ pub fn encode_with_template(
     }
     build_package(
         template,
-        data,
         &layout.layout,
         &encoder,
+        &chunk_templates,
         &chunk_offsets,
         &chunk_data,
         settings,
@@ -1075,18 +1101,12 @@ impl<'a> Encoder<'a> {
                 self.encode_array_elements(values, inner, count, start, limit)
             }
             _ if red_type.starts_with("handle:") || red_type.starts_with("whandle:") => {
-                let pointer = if self.reader.version == 2 {
+                let template_pointer = if self.reader.version == 2 {
                     i32::from(i16_at(self.template, start)?)
                 } else {
                     u32_at(self.template, start)?.cast_signed()
                 };
-                if pointer >= 0
-                    && let Some(data) = value.get("Data")
-                {
-                    let index =
-                        usize::try_from(pointer).map_err(|_| malformed(start, "handle pointer"))?;
-                    self.chunks.borrow_mut().insert(index, data);
-                }
+                let pointer = self.resolve_handle(value, template_pointer, start)?;
                 let bytes = if self.reader.version == 2 {
                     i16::try_from(pointer)
                         .map_err(|_| malformed(start, "handle pointer"))?
@@ -1149,6 +1169,83 @@ impl<'a> Encoder<'a> {
         }
     }
 
+    fn resolve_handle(
+        &self,
+        value: &'a Value,
+        template_pointer: i32,
+        start: usize,
+    ) -> Result<i32, PackageError> {
+        if value.is_null() {
+            return Ok(-1);
+        }
+        if let Some(reference) = value.get("HandleRefId").and_then(Value::as_str) {
+            let reference = reference
+                .parse::<i64>()
+                .map_err(|_| malformed(start, "handle reference"))?;
+            if reference < 0 {
+                return Ok(-1);
+            }
+            let index = self
+                .handle_ids
+                .borrow()
+                .get(&reference.to_string())
+                .copied()
+                .ok_or_else(|| unsupported("unknown package handle reference"))?;
+            return i32::try_from(index).map_err(|_| malformed(start, "handle pointer"));
+        }
+        let data = value
+            .get("Data")
+            .ok_or_else(|| malformed(start, "handle Data"))?;
+        let handle_id = value.get("HandleId").and_then(Value::as_str);
+        if let Some(handle_id) = handle_id
+            && let Some(index) = self.handle_ids.borrow().get(handle_id).copied()
+        {
+            self.chunks.borrow_mut().insert(index, data);
+            return i32::try_from(index).map_err(|_| malformed(start, "handle pointer"));
+        }
+        if let Some(index) = self
+            .chunks
+            .borrow()
+            .iter()
+            .find_map(|(&index, &existing)| std::ptr::eq(existing, data).then_some(index))
+        {
+            return i32::try_from(index).map_err(|_| malformed(start, "handle pointer"));
+        }
+
+        let template_index = if template_pointer >= 0 {
+            usize::try_from(template_pointer).map_err(|_| malformed(start, "handle pointer"))?
+        } else {
+            let class_name = data
+                .get("$type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| malformed(start, "handle class"))?;
+            *self
+                .class_templates
+                .get(class_name)
+                .ok_or_else(|| unsupported("new package handle class"))?
+        };
+        let index =
+            if template_pointer >= 0 && self.claimed_chunks.borrow_mut().insert(template_index) {
+                template_index
+            } else {
+                if !self.discovering.get() {
+                    return Err(unsupported("late package handle discovery"));
+                }
+                let mut templates = self.chunk_templates.borrow_mut();
+                let index = templates.len();
+                templates.push(template_index);
+                self.claimed_chunks.borrow_mut().insert(index);
+                index
+            };
+        self.chunks.borrow_mut().insert(index, data);
+        if let Some(handle_id) = handle_id {
+            self.handle_ids
+                .borrow_mut()
+                .insert(handle_id.to_owned(), index);
+        }
+        i32::try_from(index).map_err(|_| malformed(start, "handle pointer"))
+    }
+
     fn encode_array(
         &self,
         value: &'a Value,
@@ -1187,11 +1284,17 @@ impl<'a> Encoder<'a> {
             templates.push((cursor, element_limit, end));
             cursor = end;
         }
-        if values.len() > templates.len() {
-            return Err(unsupported("package array growth beyond template count"));
+        if templates.is_empty() && !values.is_empty() {
+            return Err(unsupported(
+                "package array growth requires an existing element template",
+            ));
         }
         let mut output = Vec::new();
-        for (value, (element_start, element_limit, _)) in values.iter().zip(&templates) {
+        for (index, value) in values.iter().enumerate() {
+            let (element_start, element_limit, _) = templates
+                .get(index)
+                .or_else(|| templates.last())
+                .expect("non-empty values require an element template");
             let (encoded, _) =
                 self.encode_value(value, "", "", inner, *element_start, *element_limit)?;
             output.extend_from_slice(&encoded);
@@ -1350,9 +1453,9 @@ impl<'a> Encoder<'a> {
 )]
 fn build_package(
     template: &[u8],
-    _data: &Value,
     layout: &PackageLayout,
     encoder: &Encoder<'_>,
+    chunk_templates: &[usize],
     chunk_offsets: &[usize],
     chunk_data: &[u8],
     settings: PackageSettings,
@@ -1445,19 +1548,20 @@ fn build_package(
     output.resize(
         output
             .len()
-            .checked_add(layout.chunks.len() * 8)
+            .checked_add(chunk_templates.len() * 8)
             .ok_or_else(|| malformed(base, "chunk descriptors"))?,
         0,
     );
     let chunk_data_offset = relative_offset(output.len(), base)?;
-    for (index, ((type_index, _), chunk_offset)) in
-        layout.chunks.iter().zip(chunk_offsets).enumerate()
+    for (index, (&template_index, chunk_offset)) in
+        chunk_templates.iter().zip(chunk_offsets).enumerate()
     {
         let entry = chunk_descriptor_start + index * 8;
+        let (type_index, _) = layout.chunks[template_index];
         write_u32(
             &mut output,
             entry,
-            u32::try_from(*type_index).map_err(|_| malformed(entry, "chunk type index"))?,
+            u32::try_from(type_index).map_err(|_| malformed(entry, "chunk type index"))?,
         )?;
         write_u32(
             &mut output,
