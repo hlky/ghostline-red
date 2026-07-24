@@ -584,6 +584,7 @@ fn decode_array(
     let payload = cursor.take(compressed_size)?;
     match array_type {
         2 => decode_huffman_one_partition(payload, decoded_size, payload_offset),
+        4 => decode_huffman_two_partitions(payload, decoded_size, payload_offset),
         3 => decode_rle(payload, decoded_size, payload_offset, depth + 1),
         5 => decode_recursive_arrays(payload, decoded_size, payload_offset, depth + 1),
         _ => Err(KrakenError::UnsupportedQuantum { offset: start }),
@@ -596,17 +597,64 @@ fn decode_huffman_one_partition(
     offset: usize,
 ) -> Result<Vec<u8>, KrakenError> {
     let (table, table_size) = decode_huffman_table(payload, offset)?;
-    let split_bytes = payload
-        .get(table_size..table_size + 2)
+    decode_huffman_group(
+        &table,
+        &payload[table_size..],
+        decoded_size,
+        offset + table_size,
+    )
+}
+
+fn decode_huffman_two_partitions(
+    payload: &[u8],
+    decoded_size: usize,
+    offset: usize,
+) -> Result<Vec<u8>, KrakenError> {
+    let (table, table_size) = decode_huffman_table(payload, offset)?;
+    let partition_bytes =
+        payload
+            .get(table_size..table_size + 3)
+            .ok_or(KrakenError::Truncated {
+                offset: offset + table_size,
+            })?;
+    let first_size = usize::from(partition_bytes[0])
+        | usize::from(partition_bytes[1]) << 8
+        | usize::from(partition_bytes[2]) << 16;
+    let groups = payload
+        .get(table_size + 3..)
         .ok_or(KrakenError::Truncated {
-            offset: offset + table_size,
+            offset: offset + table_size + 3,
         })?;
+    if first_size > groups.len() {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    let first_decoded = decoded_size.div_ceil(2);
+    let mut output = decode_huffman_group(
+        &table,
+        &groups[..first_size],
+        first_decoded,
+        offset + table_size + 3,
+    )?;
+    output.extend(decode_huffman_group(
+        &table,
+        &groups[first_size..],
+        decoded_size - first_decoded,
+        offset + table_size + 3 + first_size,
+    )?);
+    Ok(output)
+}
+
+fn decode_huffman_group(
+    table: &OldHuffmanTable,
+    payload: &[u8],
+    decoded_size: usize,
+    offset: usize,
+) -> Result<Vec<u8>, KrakenError> {
+    let split_bytes = payload.get(..2).ok_or(KrakenError::Truncated { offset })?;
     let first_len = usize::from(u16::from_le_bytes([split_bytes[0], split_bytes[1]]));
     let streams = payload
-        .get(table_size + 2..)
-        .ok_or(KrakenError::Truncated {
-            offset: offset + table_size + 2,
-        })?;
+        .get(2..)
+        .ok_or(KrakenError::Truncated { offset: offset + 2 })?;
     if first_len > streams.len() {
         return Err(KrakenError::InvalidArray { offset });
     }
@@ -1730,6 +1778,32 @@ mod tests {
                 decode_hex(expected)
             );
         }
+    }
+
+    #[test]
+    fn decodes_two_partition_huffman_array() {
+        let group = [
+            0x11, 0x00, // first forward stream is seventeen bytes
+            0xb9, 0x83, 0xc4, 0x2b, 0xb7, 0x3d, 0x80, 0x75, 0x94, 0xd1, 0x08, 0xe1, 0xe2, 0x60,
+            0x7d, 0xdd, 0x00, 0x61, 0xac, 0x8a, 0x36, 0xe8, 0x67, 0xee, 0x03, 0x9e, 0x59, 0x75,
+            0x46, 0x2c, 0xdb, 0xf6, 0x28, 0x00, 0xb2, 0xc5, 0xf5, 0x52, 0x74, 0xed, 0xd4, 0x60,
+            0x3b, 0x82, 0x93, 0xce, 0x6e, 0xe1, 0x90, 0x3e,
+        ];
+        let mut bytes = vec![
+            0x40, 0x03, 0xfc, 0x00, 0x71, // type 4: 113 -> 256
+            0x90, 0x70, 0x08, 0x95, 0xff, 0xe0, // new eight-symbol table
+            0x34, 0x00, 0x00, // first partition is 52 bytes
+        ];
+        bytes.extend_from_slice(&group);
+        bytes.extend_from_slice(&group);
+        let mut half: Vec<u8> = (0..128_usize)
+            .map(|index| u8::try_from(index % 8).unwrap())
+            .collect();
+        deterministic_shuffle(&mut half, 0x299f_31d0);
+        let expected = [half.as_slice(), half.as_slice()].concat();
+        let mut cursor = Cursor::new(&bytes, 0);
+        assert_eq!(decode_array(&mut cursor, Some(256), 0), Ok(expected));
+        assert!(cursor.is_empty());
     }
 
     fn decode_hex(value: &str) -> Vec<u8> {

@@ -356,6 +356,30 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "clean-room type-4 Huffman differential test; requires KRAKEN_DLL"]
+    fn clean_room_decodes_native_type_four_huffman_partitions() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for &alphabet in &[5_u8, 8, 16] {
+            let mut state = 0x6a09_e667_u32 ^ u32::from(alphabet);
+            let payload: Vec<u8> = (0..131_072)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state.to_le_bytes()[0] % alphabet
+                })
+                .collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            assert_eq!(
+                crate::kraken::decode(&encoded, payload.len()),
+                Ok(payload),
+                "alphabet {alphabet}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "clean-room whole-match probe; requires KRAKEN_DLL"]
     fn print_oracle_whole_match_quantums() {
         use std::fmt::Write as _;
@@ -849,6 +873,30 @@ mod tests {
                 write!(&mut hex, "{byte:02x}").unwrap();
             }
             println!("symbols={symbols:02x?} table={hex}");
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room large Huffman partition probe; requires KRAKEN_DLL"]
+    fn print_oracle_large_entropy_partitions() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for &alphabet in &[5_u8, 8, 16, 32, 64] {
+            let mut state = 0x6a09_e667_u32 ^ u32::from(alphabet);
+            let payload: Vec<u8> = (0..131_072)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state.to_le_bytes()[0] % alphabet
+                })
+                .collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            println!(
+                "alphabet={alphabet} encoded={} head={:02x?}",
+                encoded.len(),
+                &encoded[..encoded.len().min(24)]
+            );
         }
     }
 }
