@@ -1248,6 +1248,8 @@ mod tests {
         let path = PathBuf::from(std::env::var_os("ARCHIVE_FIXTURE").unwrap());
         let index = read_archive(&path).unwrap();
         let mut archive = fs::File::open(path).unwrap();
+        let native = std::env::var_os("KRAKEN_DLL")
+            .map(|path| crate::compression::Kraken::load(OsStr::new(&path)).unwrap());
         let mut failures = Vec::new();
         let mut decoded = 0_usize;
         for (segment_index, &segment) in index.segments.iter().enumerate() {
@@ -1260,7 +1262,24 @@ mod tests {
                 OsStr::new("intentionally-missing-kraken.dll"),
                 true,
             ) {
-                Ok(bytes) if bytes.len() == usize::try_from(segment.size).unwrap() => decoded += 1,
+                Ok(bytes) if bytes.len() == usize::try_from(segment.size).unwrap() => {
+                    if let Some(native) = &native {
+                        archive.seek(SeekFrom::Start(segment.offset)).unwrap();
+                        let mut encoded =
+                            vec![0; usize::try_from(segment.compressed_size).unwrap()];
+                        archive.read_exact(&mut encoded).unwrap();
+                        let expected = native
+                            .decompress(&encoded[8..], usize::try_from(segment.size).unwrap())
+                            .unwrap();
+                        if bytes != expected {
+                            failures.push(format!(
+                                "segment {segment_index}: clean/native bytes differ"
+                            ));
+                            continue;
+                        }
+                    }
+                    decoded += 1;
+                }
                 Ok(bytes) => failures.push(format!(
                     "segment {segment_index}: decoded {} of {} bytes",
                     bytes.len(),

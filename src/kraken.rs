@@ -1173,6 +1173,7 @@ fn decode_array(
     let payload_offset = cursor.absolute_offset();
     let payload = cursor.take(compressed_size)?;
     match array_type {
+        1 => decode_tans(payload, decoded_size, payload_offset),
         2 => decode_huffman_one_partition(payload, decoded_size, payload_offset),
         4 => decode_huffman_two_partitions(payload, decoded_size, payload_offset),
         3 => decode_rle(payload, decoded_size, payload_offset, depth + 1),
@@ -1570,6 +1571,354 @@ impl<'a> MsbReader<'a> {
 
     fn consumed_bytes(&self) -> usize {
         self.position.div_ceil(8)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TansEntry {
+    mask: usize,
+    bits: usize,
+    symbol: u8,
+    base: usize,
+}
+
+fn decode_tans(payload: &[u8], decoded_size: usize, offset: usize) -> Result<Vec<u8>, KrakenError> {
+    if payload.len() < 8 || decoded_size < 5 {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    let mut header = MsbReader::new(payload);
+    if header.read(1) != Some(0) {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    let table_bits = header
+        .read(2)
+        .and_then(|value| value.checked_add(8))
+        .ok_or(KrakenError::InvalidArray { offset })?;
+    let weights =
+        decode_tans_weights(&mut header, table_bits).ok_or(KrakenError::InvalidArray { offset })?;
+    let table =
+        build_tans_table(&weights, table_bits).ok_or(KrakenError::InvalidArray { offset })?;
+    let stream = payload
+        .get(header.consumed_bytes()..)
+        .ok_or(KrakenError::InvalidArray { offset })?;
+    let mut bits = TansPairedBits::new(stream);
+    let states = [
+        bits.read_front(table_bits),
+        bits.read_back(table_bits),
+        bits.read_front(table_bits),
+        bits.read_back(table_bits),
+        bits.read_front(table_bits),
+    ];
+    if states.iter().any(Option::is_none) {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    let mut states = states.map(Option::unwrap);
+    let body_size = decoded_size - 5;
+    let mut output = Vec::with_capacity(decoded_size);
+    while output.len() < body_size {
+        for side in [false, true] {
+            for state in &mut states {
+                if output.len() == body_size {
+                    break;
+                }
+                let entry = table
+                    .get(*state)
+                    .copied()
+                    .ok_or(KrakenError::InvalidArray { offset })?;
+                output.push(entry.symbol);
+                let value = if side {
+                    bits.read_back(entry.bits)
+                } else {
+                    bits.read_front(entry.bits)
+                }
+                .ok_or(KrakenError::InvalidArray { offset })?;
+                *state = entry
+                    .base
+                    .checked_add(value & entry.mask)
+                    .ok_or(KrakenError::InvalidArray { offset })?;
+            }
+        }
+    }
+    if !bits.consumed_exactly() || states.iter().any(|&state| state > 0xff) {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    output.extend(states.map(|state| u8::try_from(state).unwrap()));
+    Ok(output)
+}
+
+fn decode_tans_weights(bits: &mut MsbReader<'_>, table_bits: usize) -> Option<Vec<(u8, usize)>> {
+    let table_size = 1_usize.checked_shl(u32::try_from(table_bits).ok()?)?;
+    if bits.read(1)? == 0 {
+        let count = bits.read(3)?.checked_add(1)?;
+        let delta_bits = bits.read(4)?;
+        if delta_bits == 0 || delta_bits > table_bits {
+            return None;
+        }
+        let mut seen = [false; 256];
+        let mut weights = Vec::with_capacity(count + 1);
+        let mut weight = 0_usize;
+        let mut total = 0_usize;
+        for _ in 0..count {
+            let symbol = u8::try_from(bits.read(8)?).ok()?;
+            if seen[usize::from(symbol)] {
+                return None;
+            }
+            weight = weight.checked_add(bits.read(delta_bits)?)?;
+            if weight == 0 {
+                return None;
+            }
+            total = total.checked_add(weight)?;
+            if total >= table_size {
+                return None;
+            }
+            seen[usize::from(symbol)] = true;
+            weights.push((symbol, weight));
+        }
+        let symbol = u8::try_from(bits.read(8)?).ok()?;
+        let remaining = table_size.checked_sub(total)?;
+        if seen[usize::from(symbol)] || remaining <= 1 || remaining < weight {
+            return None;
+        }
+        weights.push((symbol, remaining));
+        weights.sort_unstable();
+        return Some(weights);
+    }
+
+    let base_bits = bits.read(3)?;
+    let symbol_count = bits.read(8)?.checked_add(1)?;
+    if symbol_count < 2 {
+        return None;
+    }
+    let fluff = tans_fluff(bits, symbol_count)?;
+    let mut rice = Vec::with_capacity(symbol_count.checked_add(fluff)?);
+    for _ in 0..symbol_count.checked_add(fluff)? {
+        rice.push(bits.read_unary()?);
+    }
+    let ranges = decode_symbol_ranges(bits, symbol_count, &rice[symbol_count..])?;
+    let mut weights = Vec::with_capacity(symbol_count);
+    let mut average = 6_i32;
+    let mut total = 0_usize;
+    let mut rice_index = 0_usize;
+    for (start, count) in ranges {
+        for symbol in start..start.checked_add(count)? {
+            let extra_bits = base_bits.checked_add(*rice.get(rice_index)?)?;
+            rice_index += 1;
+            if extra_bits > 15 {
+                return None;
+            }
+            let mut value = i32::try_from(bits.read(extra_bits)?).ok()? + (1_i32 << extra_bits)
+                - (1_i32 << base_bits);
+            let average_quarter = average >> 2;
+            let mut limit = 2 * average_quarter;
+            if value <= limit {
+                value = average_quarter + (-(value & 1) ^ (value >> 1));
+            }
+            limit = limit.min(value);
+            let weight = usize::try_from(value.checked_add(1)?).ok()?;
+            average = average.checked_add(limit - average_quarter)?;
+            total = total.checked_add(weight)?;
+            weights.push((u8::try_from(symbol).ok()?, weight));
+        }
+    }
+    if rice_index != symbol_count || total != table_size {
+        return None;
+    }
+    Some(weights)
+}
+
+fn tans_fluff(bits: &mut MsbReader<'_>, symbol_count: usize) -> Option<usize> {
+    if symbol_count == 256 {
+        Some(0)
+    } else {
+        let range = symbol_count.min(257_usize.checked_sub(symbol_count)?);
+        bits.read_truncated(range.checked_mul(2)?)
+    }
+}
+
+fn decode_symbol_ranges(
+    bits: &mut MsbReader<'_>,
+    symbol_count: usize,
+    codes: &[usize],
+) -> Option<Vec<(usize, usize)>> {
+    let mut ranges = Vec::with_capacity((codes.len() >> 1) + 1);
+    let mut code = 0_usize;
+    let mut symbol = 0_usize;
+    let mut used = 0_usize;
+    if codes.len() & 1 != 0 {
+        let width = *codes.get(code)?;
+        code += 1;
+        if width >= 8 {
+            return None;
+        }
+        symbol = bits.read(width + 1)? + (1_usize << (width + 1)) - 1;
+    }
+    for _ in 0..(codes.len() >> 1) {
+        let count_width = *codes.get(code)?;
+        let space_width = *codes.get(code + 1)?;
+        code += 2;
+        if count_width >= 9 || space_width >= 8 {
+            return None;
+        }
+        let count = bits.read(count_width)? + (1_usize << count_width);
+        let space = bits.read(space_width + 1)? + (1_usize << (space_width + 1)) - 1;
+        if symbol.checked_add(count)? > 256 {
+            return None;
+        }
+        ranges.push((symbol, count));
+        used = used.checked_add(count)?;
+        symbol = symbol.checked_add(count)?.checked_add(space)?;
+    }
+    let remaining = symbol_count.checked_sub(used)?;
+    if remaining == 0 || symbol.checked_add(remaining)? > 256 || code != codes.len() {
+        return None;
+    }
+    ranges.push((symbol, remaining));
+    Some(ranges)
+}
+
+fn build_tans_table(weights: &[(u8, usize)], table_bits: usize) -> Option<Vec<TansEntry>> {
+    let table_size = 1_usize.checked_shl(u32::try_from(table_bits).ok()?)?;
+    let singles: Vec<u8> = weights
+        .iter()
+        .filter_map(|&(symbol, weight)| (weight == 1).then_some(symbol))
+        .collect();
+    let allocated = table_size.checked_sub(singles.len())?;
+    let quarter = allocated >> 2;
+    let mut pointers = [
+        0,
+        quarter + usize::from(allocated & 3 > 0),
+        quarter * 2 + usize::from(allocated & 3 > 0) + usize::from(allocated & 3 > 1),
+        quarter * 3
+            + usize::from(allocated & 3 > 0)
+            + usize::from(allocated & 3 > 1)
+            + usize::from(allocated & 3 > 2),
+    ];
+    let mut table = vec![TansEntry::default(); table_size];
+    for (index, symbol) in singles.into_iter().enumerate() {
+        table[allocated + index] = TansEntry {
+            mask: table_size - 1,
+            bits: table_bits,
+            symbol,
+            base: 0,
+        };
+    }
+
+    let mut weight_sum = 0_usize;
+    for &(symbol, weight) in weights.iter().filter(|(_, weight)| *weight >= 2) {
+        if weight > 4 {
+            let symbol_bits = usize::try_from(weight.ilog2()).ok()?;
+            let mut shift = table_bits.checked_sub(symbol_bits)?;
+            let mut entry = TansEntry {
+                mask: (1_usize << shift) - 1,
+                bits: shift,
+                symbol,
+                base: (table_size - 1) & (weight << shift),
+            };
+            let mut increment = 1_usize << shift;
+            let mut short_count = (1_usize << (symbol_bits + 1)).checked_sub(weight)?;
+            for (partition, pointer) in pointers.iter_mut().enumerate() {
+                let count = (weight + weight_sum.wrapping_sub(partition + 1) % 4).checked_div(4)?;
+                let first = short_count.min(count);
+                for _ in 0..first {
+                    *table.get_mut(*pointer)? = entry;
+                    *pointer += 1;
+                    entry.base = entry.base.checked_add(increment)?;
+                }
+                short_count -= first;
+                if first != count {
+                    shift = shift.checked_sub(1)?;
+                    increment >>= 1;
+                    entry.bits = shift;
+                    entry.mask >>= 1;
+                    entry.base = 0;
+                    for _ in first..count {
+                        *table.get_mut(*pointer)? = entry;
+                        *pointer += 1;
+                        entry.base = entry.base.checked_add(increment)?;
+                    }
+                    short_count = weight;
+                }
+            }
+        } else {
+            let mut partitions = ((1_u32 << weight) - 1) << (weight_sum & 3);
+            partitions |= partitions >> 4;
+            for sequence in weight..weight.checked_mul(2)? {
+                let partition = usize::try_from(partitions.trailing_zeros()).ok()?;
+                partitions &= partitions - 1;
+                let pointer = pointers.get_mut(partition)?;
+                let symbol_bits = usize::try_from(sequence.ilog2()).ok()?;
+                let shift = table_bits.checked_sub(symbol_bits)?;
+                *table.get_mut(*pointer)? = TansEntry {
+                    mask: (1_usize << shift) - 1,
+                    bits: shift,
+                    symbol,
+                    base: (table_size - 1) & (sequence << shift),
+                };
+                *pointer += 1;
+            }
+        }
+        weight_sum = weight_sum.checked_add(weight)?;
+    }
+    if pointers
+        != [
+            quarter + usize::from(allocated & 3 > 0),
+            quarter * 2 + usize::from(allocated & 3 > 0) + usize::from(allocated & 3 > 1),
+            quarter * 3
+                + usize::from(allocated & 3 > 0)
+                + usize::from(allocated & 3 > 1)
+                + usize::from(allocated & 3 > 2),
+            allocated,
+        ]
+    {
+        return None;
+    }
+    Some(table)
+}
+
+struct TansPairedBits<'a> {
+    bytes: &'a [u8],
+    front: usize,
+    back: usize,
+}
+
+impl<'a> TansPairedBits<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            front: 0,
+            back: 0,
+        }
+    }
+
+    fn read_front(&mut self, count: usize) -> Option<usize> {
+        let mut value = 0_usize;
+        for shift in 0..count {
+            if self.front.checked_add(self.back)? >= self.bytes.len().checked_mul(8)? {
+                return None;
+            }
+            let bit = self.bytes[self.front / 8] >> (self.front & 7) & 1;
+            value |= usize::from(bit) << shift;
+            self.front += 1;
+        }
+        Some(value)
+    }
+
+    fn read_back(&mut self, count: usize) -> Option<usize> {
+        let mut value = 0_usize;
+        for shift in 0..count {
+            if self.front.checked_add(self.back)? >= self.bytes.len().checked_mul(8)? {
+                return None;
+            }
+            let byte = self.bytes.len().checked_sub(self.back / 8 + 1)?;
+            let bit = self.bytes[byte] >> (self.back & 7) & 1;
+            value |= usize::from(bit) << shift;
+            self.back += 1;
+        }
+        Some(value)
+    }
+
+    fn consumed_exactly(&self) -> bool {
+        self.front.div_ceil(8) + self.back.div_ceil(8) == self.bytes.len()
     }
 }
 
@@ -2580,6 +2929,27 @@ mod tests {
         let mut cursor = Cursor::new(&bytes, 100);
         assert_eq!(decode_array(&mut cursor, Some(4), 0), Ok(vec![1, 2, 3, 4]));
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_real_dense_tans_array() {
+        let encoded = decode_hex(
+            "1001c4004e142ae484c46b9afe3293fc10141fbb0673488602b35ea00959305bd2\
+             aeb37592c9893f8b958a4b65b3a27af652b1f577881104061aae6ae674d141dad1\
+             c0b4ab18feea703da9a0212c9c071fd7d8",
+        );
+        let expected = decode_hex(
+            "02030303070102030114241d04030513110c030b020100020201050505050505050502030005050505040c000106020202020202a201020b0a020200010602020506060605050506060600070201020206110611061d020902090215061106110611051f0221020912120215021502210310",
+        );
+        let mut cursor = Cursor::new(&encoded, 911);
+
+        assert_eq!(decode_array(&mut cursor, Some(114), 0), Ok(expected));
+        assert!(cursor.is_empty());
+
+        let mut reserved = encoded.clone();
+        reserved[5] |= 0x80;
+        assert!(decode_array(&mut Cursor::new(&reserved, 0), Some(114), 0).is_err());
+        assert!(decode_array(&mut Cursor::new(&encoded[..20], 0), Some(114), 0).is_err());
     }
 
     #[test]
