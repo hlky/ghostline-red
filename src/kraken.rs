@@ -43,6 +43,16 @@ pub enum KrakenError {
 /// emitted verbatim using the format's uncompressed block representation.
 #[must_use]
 pub fn encode(input: &[u8]) -> Vec<u8> {
+    if input.len() >= 288
+        && input.get(8..).is_some_and(|tail| {
+            tail.iter()
+                .zip(input.iter())
+                .all(|(left, right)| left == right)
+        })
+        && input.windows(2).any(|pair| pair[0] != pair[1])
+    {
+        return encode_period_eight_stream(input);
+    }
     let mut output = Vec::with_capacity(
         input
             .len()
@@ -61,6 +71,103 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
         }
     }
     output
+}
+
+fn encode_period_eight_stream(input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::new();
+    let mut absolute_offset = 0_usize;
+    for block in input.chunks(BLOCK_SIZE) {
+        let encoded_block = encode_period_eight_block(block, absolute_offset);
+        if encoded_block.len() < block.len() + RAW_BLOCK_HEADER.len() {
+            output.extend_from_slice(&encoded_block);
+        } else {
+            output.extend_from_slice(&RAW_BLOCK_HEADER);
+            output.extend_from_slice(block);
+        }
+        absolute_offset += block.len();
+    }
+    output
+}
+
+fn encode_period_eight_block(block: &[u8], absolute_offset: usize) -> Vec<u8> {
+    let mut quantum = Vec::new();
+    let mut chunk_offset = 0_usize;
+    for chunk in block.chunks(CHUNK_SIZE) {
+        let has_initial_history = absolute_offset + chunk_offset == 0;
+        let minimum = if has_initial_history { 288 } else { 280 };
+        if chunk.len() < minimum {
+            write_be24(
+                &mut quantum,
+                0x80_0000 | u32::try_from(chunk.len()).unwrap_or(u32::MAX),
+            );
+            quantum.extend_from_slice(chunk);
+            chunk_offset += chunk.len();
+            continue;
+        }
+
+        let final_literals = &chunk[chunk.len() - 8..];
+        let match_length = chunk.len() - 8 - usize::from(has_initial_history) * 8;
+        let extended_length = match_length - 272;
+        let mut lz = Vec::new();
+        if has_initial_history {
+            lz.extend_from_slice(&chunk[..8]);
+        }
+        encode_stored_array(&mut lz, final_literals);
+        encode_stored_array(&mut lz, &[0x7c]);
+        encode_stored_array(&mut lz, &[]);
+        encode_stored_array(&mut lz, &[0xff]);
+        lz.extend_from_slice(&encode_extended_length(extended_length));
+        lz.push(0x40);
+
+        write_be24(
+            &mut quantum,
+            0x88_0000 | u32::try_from(lz.len()).unwrap_or(u32::MAX),
+        );
+        quantum.extend_from_slice(&lz);
+        chunk_offset += chunk.len();
+    }
+
+    let mut output = Vec::with_capacity(quantum.len() + 5);
+    output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+    write_be24(
+        &mut output,
+        u32::try_from(quantum.len().saturating_sub(1)).unwrap_or(u32::MAX),
+    );
+    output.extend_from_slice(&quantum);
+    output
+}
+
+fn encode_stored_array(output: &mut Vec<u8>, bytes: &[u8]) {
+    write_be24(output, u32::try_from(bytes.len()).unwrap_or(u32::MAX));
+    output.extend_from_slice(bytes);
+}
+
+fn encode_extended_length(value: usize) -> Vec<u8> {
+    let mut tier = 0_u32;
+    let mut base = 0_usize;
+    while value >= base + (1_usize << (tier + 6)) {
+        base += 1_usize << (tier + 6);
+        tier += 1;
+    }
+    let payload = value - base;
+    let mut bits = Vec::with_capacity(usize::try_from(tier * 2 + 7).unwrap_or(64));
+    bits.resize(usize::try_from(tier).unwrap_or(0), false);
+    bits.push(true);
+    for shift in (0..tier + 6).rev() {
+        bits.push((payload >> shift) & 1 != 0);
+    }
+    let mut output = vec![0_u8; bits.len().div_ceil(8)];
+    for (index, bit) in bits.into_iter().enumerate() {
+        if bit {
+            output[index / 8] |= 1 << (7 - index % 8);
+        }
+    }
+    output
+}
+
+fn write_be24(output: &mut Vec<u8>, value: u32) {
+    let bytes = value.to_be_bytes();
+    output.extend_from_slice(&bytes[1..]);
 }
 
 /// Decodes raw blocks, constant-byte blocks, and stored quantums.
@@ -1114,8 +1221,9 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array, decode_lz_payload,
-        decode_quantum, decode_scaled_offset_value, encode, execute_lz_commands,
+        BLOCK_SIZE, CHUNK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array,
+        decode_lz_payload, decode_quantum, decode_scaled_offset_value, encode,
+        encode_extended_length, execute_lz_commands,
     };
 
     #[test]
@@ -1145,6 +1253,34 @@ mod tests {
             encode(&vec![0x5a; BLOCK_SIZE]),
             [0x8c, 0x06, 0x07, 0xff, 0xff, 0x5a]
         );
+    }
+
+    #[test]
+    fn period_eight_inputs_use_lz_encoding() {
+        let seed = [0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00];
+        for size in [288_usize, 512, CHUNK_SIZE, BLOCK_SIZE, BLOCK_SIZE + 512] {
+            let payload: Vec<u8> = seed.iter().copied().cycle().take(size).collect();
+            let encoded = encode(&payload);
+            assert!(encoded.len() < payload.len(), "encoded size {size}");
+            assert_eq!(decode(&encoded, size), Ok(payload));
+        }
+    }
+
+    #[test]
+    fn encodes_extended_length_tiers() {
+        for (value, expected) in [
+            (0_usize, &[0x80][..]),
+            (12, &[0x98]),
+            (63, &[0xfe]),
+            (64, &[0x40, 0x00]),
+            (112, &[0x58, 0x00]),
+            (224, &[0x24, 0x00]),
+            (480, &[0x11, 0x00]),
+            (3_808, &[0x07, 0x90, 0x00]),
+            (130_784, &[0x00, 0x3f, 0xe4, 0x00]),
+        ] {
+            assert_eq!(encode_extended_length(value), expected);
+        }
     }
 
     #[test]

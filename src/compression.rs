@@ -301,10 +301,18 @@ mod tests {
                 value.to_le_bytes()[0]
             })
             .collect();
+        let period_seed = [0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00];
+        let period: Vec<u8> = period_seed
+            .iter()
+            .copied()
+            .cycle()
+            .take(262_144 + 512)
+            .collect();
         for payload in [
             block.clone(),
             vec![0x5a; 262_144],
             [block.as_slice(), vec![0xa5; 262_144].as_slice()].concat(),
+            period,
         ] {
             let encoded = crate::kraken::encode(&payload);
             assert_eq!(kraken.decompress(&encoded, payload.len()).unwrap(), payload);
