@@ -1539,7 +1539,20 @@ fn decode_recursive_arrays(
     let mut cursor = Cursor::new(payload, offset);
     let count_byte = cursor.read_byte()?;
     let count = usize::from(count_byte & 0x7f);
-    if count < 2 || count_byte & 0x80 != 0 {
+    if count_byte & 0x80 != 0 {
+        let source_count = usize::from(count_byte & 0x3f);
+        if source_count != 0 {
+            return Err(KrakenError::UnsupportedQuantum { offset });
+        }
+        let output = decode_array(&mut cursor, Some(decoded_size), depth)?;
+        if !cursor.is_empty() {
+            return Err(KrakenError::InvalidArray {
+                offset: cursor.absolute_offset(),
+            });
+        }
+        return Ok(output);
+    }
+    if count < 2 {
         return Err(KrakenError::UnsupportedQuantum { offset });
     }
     let mut output = Vec::with_capacity(decoded_size);
@@ -2532,6 +2545,18 @@ mod tests {
             decode_array(&mut cursor, Some(16), 0),
             Ok([vec![b'a'; 8], vec![b'b'; 8]].concat())
         );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_zero_source_multi_array_passthrough() {
+        let bytes = [
+            0x50, 0x00, 0x3c, 0x00, 0x07, // type 5: 7 -> 16
+            0x80, // multi-array form with zero temporary source arrays
+            0x30, 0x00, 0x3c, 0x00, 0x01, b'x', // one requested destination array
+        ];
+        let mut cursor = Cursor::new(&bytes, 0);
+        assert_eq!(decode_array(&mut cursor, Some(16), 0), Ok(vec![b'x'; 16]));
         assert!(cursor.is_empty());
     }
 
