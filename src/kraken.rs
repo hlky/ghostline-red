@@ -132,18 +132,18 @@ fn encode_huffman_array(input: &[u8]) -> Option<Vec<u8>> {
         let alphabet_size = u8::try_from(symbols.len()).ok()?;
         (alphabet_size, 0, encode_old_huffman_table(&symbols)?)
     } else {
-        let alphabet_size = [5_u8, 8, 16]
+        let alphabet_size = [5_u8, 8, 16, 32, 64, 128]
             .into_iter()
             .find(|&size| span <= usize::from(size))?;
         let start = minimum.min(u8::MAX - alphabet_size + 1);
         if usize::from(maximum) >= usize::from(start) + usize::from(alphabet_size) {
             return None;
         }
-        (
-            alphabet_size,
-            start,
-            encode_contiguous_new_huffman_header(alphabet_size, start),
-        )
+        let table = encode_contiguous_new_huffman_header(alphabet_size, start);
+        if table.is_empty() {
+            return None;
+        }
+        (alphabet_size, start, table)
     };
     let mut first_bits = LsbWriter::with_capacity(input.len().div_ceil(3));
     let mut second_bits = LsbWriter::with_capacity(input.len() / 3);
@@ -190,7 +190,7 @@ fn huffman_encoder_code(alphabet_size: u8, symbol_index: u8) -> Option<(u16, u8)
         5 => [(0b00, 2), (0b10, 2), (0b01, 2), (0b011, 3), (0b111, 3)]
             .get(usize::from(symbol_index))
             .copied(),
-        8 | 16 if symbol_index < alphabet_size => {
+        8 | 16 | 32 | 64 | 128 if symbol_index < alphabet_size => {
             let bits = u8::try_from(alphabet_size.ilog2()).ok()?;
             Some((reverse_low_bits(u16::from(symbol_index), bits), bits))
         }
@@ -1014,7 +1014,21 @@ fn decode_huffman_table(
             }
         }
     }
-    for &(alphabet_size, max_start) in &[(5_u8, 250_u8), (8, 248), (16, 240)] {
+    if let Some(table) = decode_contiguous_new_huffman_table(payload) {
+        return Ok(table);
+    }
+    Err(KrakenError::UnsupportedQuantum { offset })
+}
+
+fn decode_contiguous_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
+    for &(alphabet_size, max_start) in &[
+        (5_u8, 250_u8),
+        (8, 248),
+        (16, 240),
+        (32, 0),
+        (64, 0),
+        (128, 0),
+    ] {
         for start in 0..=max_start {
             let header = encode_contiguous_new_huffman_header(alphabet_size, start);
             if payload.starts_with(&header) {
@@ -1038,11 +1052,11 @@ fn decode_huffman_table(
                         })
                         .collect()
                 };
-                return Ok((OldHuffmanTable { entries }, header.len()));
+                return Some((OldHuffmanTable { entries }, header.len()));
             }
         }
     }
-    Err(KrakenError::UnsupportedQuantum { offset })
+    None
 }
 
 fn reverse_low_bits(mut value: u16, bit_count: u8) -> u16 {
@@ -1059,6 +1073,14 @@ fn encode_contiguous_new_huffman_header(alphabet_size: u8, start: u8) -> Vec<u8>
         (5, 0) => vec![0xa0, 0x40, 0x4b, 0xeb, 0xa0],
         (8, 0) => vec![0x90, 0x70, 0x08, 0x95, 0xff, 0xe0],
         (16, 0) => vec![0x80, 0xf0, 0x00, 0x82, 0x22, 0xab, 0xfe],
+        (32, 0) => vec![0x81, 0xf0, 0x01, 0x11, 0x55, 0xff, 0xff, 0xff, 0x80],
+        (64, 0) => vec![
+            0x83, 0xf0, 0x02, 0x2a, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0,
+        ],
+        (128, 0) => vec![
+            0x87, 0xf0, 0x05, 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0xff, 0xff, 0xfe,
+        ],
         (5, _) => {
             let mut output = vec![0xa0, 0x42, 0x4b];
             append_new_huffman_start_code(
@@ -1790,7 +1812,7 @@ mod tests {
 
     #[test]
     fn contiguous_alphabets_use_huffman_encoding() {
-        for &alphabet in &[2_u8, 3, 4, 5, 8, 16] {
+        for &alphabet in &[2_u8, 3, 4, 5, 8, 16, 32, 64, 128] {
             for size in [128_usize, CHUNK_SIZE, BLOCK_SIZE + 1_024] {
                 let mut state = 0x510e_527f_u32 ^ u32::from(alphabet);
                 let payload: Vec<u8> = (0..size)
@@ -1798,11 +1820,14 @@ mod tests {
                         state ^= state << 13;
                         state ^= state >> 17;
                         state ^= state << 5;
-                        100 + state.to_le_bytes()[0] % alphabet
+                        let base = if alphabet <= 16 { 100 } else { 0 };
+                        base + state.to_le_bytes()[0] % alphabet
                     })
                     .collect();
                 let encoded = encode(&payload);
-                assert!(encoded.len() < payload.len(), "alphabet {alphabet}, {size}");
+                if size >= CHUNK_SIZE {
+                    assert!(encoded.len() < payload.len(), "alphabet {alphabet}, {size}");
+                }
                 assert_eq!(
                     decode(&encoded, payload.len()),
                     Ok(payload),
@@ -2008,6 +2033,9 @@ mod tests {
             (16, 15, "80f0808222abfe20"),
             (16, 127, "80f0808222abfe0400"),
             (16, 239, "80f0808222abfe0780"),
+            (32, 0, "81f0011155ffffff80"),
+            (64, 0, "83f0022afffffffffffffff0"),
+            (128, 0, "87f0057ffffffffffffffffffffffffffffffe"),
         ] {
             assert_eq!(
                 encode_contiguous_new_huffman_header(alphabet, start),

@@ -308,14 +308,15 @@ mod tests {
             .cycle()
             .take(262_144 + 512)
             .collect();
-        let entropy_cases = [2_u8, 3, 4, 5, 8, 16].map(|alphabet| {
+        let entropy_cases = [2_u8, 3, 4, 5, 8, 16, 32, 64, 128].map(|alphabet| {
             let mut state = 0x510e_527f_u32 ^ u32::from(alphabet);
             (0..262_144 + 512)
                 .map(|_| {
                     state ^= state << 13;
                     state ^= state >> 17;
                     state ^= state << 5;
-                    100 + state.to_le_bytes()[0] % alphabet
+                    let base = if alphabet <= 16 { 100 } else { 0 };
+                    base + state.to_le_bytes()[0] % alphabet
                 })
                 .collect::<Vec<_>>()
         });
@@ -387,7 +388,7 @@ mod tests {
     fn clean_room_decodes_native_type_four_huffman_partitions() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
         let kraken = Kraken::load(path.as_os_str()).unwrap();
-        for &alphabet in &[5_u8, 8, 16] {
+        for &alphabet in &[5_u8, 8, 16, 32, 64, 128] {
             let mut state = 0x6a09_e667_u32 ^ u32::from(alphabet);
             let payload: Vec<u8> = (0..131_072)
                 .map(|_| {
@@ -908,7 +909,7 @@ mod tests {
     fn print_oracle_large_entropy_partitions() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
         let kraken = Kraken::load(path.as_os_str()).unwrap();
-        for &alphabet in &[5_u8, 8, 16, 32, 64] {
+        for &alphabet in &[5_u8, 8, 16, 32, 64, 128] {
             let mut state = 0x6a09_e667_u32 ^ u32::from(alphabet);
             let payload: Vec<u8> = (0..131_072)
                 .map(|_| {
@@ -922,8 +923,46 @@ mod tests {
             println!(
                 "alphabet={alphabet} encoded={} head={:02x?}",
                 encoded.len(),
-                &encoded[..encoded.len().min(24)]
+                &encoded[..encoded.len().min(48)]
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room tANS selection probe; requires KRAKEN_DLL"]
+    fn print_oracle_tans_selections() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for &size in &[512_usize, 4_096, 131_072] {
+            for alphabet in 2_u16..=128 {
+                for &skew in &[1_u32, 2, 4, 8, 16, 32] {
+                    let mut state =
+                        0xbb67_ae85_u32 ^ u32::from(alphabet) ^ u32::try_from(size).unwrap() ^ skew;
+                    let payload: Vec<u8> = (0..size)
+                        .map(|_| {
+                            state ^= state << 13;
+                            state ^= state >> 17;
+                            state ^= state << 5;
+                            let sample = state % (u32::from(alphabet) + skew - 1);
+                            u8::try_from(if sample < skew { 0 } else { sample - skew + 1 }).unwrap()
+                        })
+                        .collect();
+                    let encoded = kraken.compress_validated(&payload).unwrap();
+                    if encoded.get(..2) != Some(&[0x8c, 0x06]) {
+                        continue;
+                    }
+                    let Some(&first) = encoded.get(5) else {
+                        continue;
+                    };
+                    if first & 0x80 == 0 && (first >> 4) & 7 == 1 {
+                        println!(
+                            "size={size} alphabet={alphabet} skew={skew} encoded={} head={:02x?}",
+                            encoded.len(),
+                            &encoded[..encoded.len().min(48)]
+                        );
+                    }
+                }
+            }
         }
     }
 }

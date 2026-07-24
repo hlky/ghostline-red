@@ -9,18 +9,20 @@ The project is currently tested most heavily on Windows. Packing works without
 a DLL and falls back to uncompressed archive segments. The clean-room Kraken
 backend encodes raw blocks, compressed constant blocks, and deterministic
 recent-offset LZ streams for period-8 data. It also emits native-compatible
-Huffman chunks for contiguous alphabets of 2–5, 8, or 16 symbols. Its decoder
-additionally handles
+Huffman chunks for contiguous alphabets of 2–5, 8, or 16 symbols and
+zero-based alphabets of 32, 64, or 128 symbols. Its decoder additionally
+handles
 stored inner chunks, stored byte
 arrays, RLE byte arrays, simple recursive array composition, and LZ streams
 with recent or explicitly coded legacy distances across both 128 KiB inner
 chunks. Scaled offsets and their low-digit streams are also supported.
 The decoder also supports the fully recovered old-table two-, three-, and
 four-symbol forms of type-2 Huffman arrays, plus contiguous uniform 5-, 8-, and
-16-symbol new-table forms. Both one-partition (type 2) and two-partition
-(type 4) Huffman framing are supported for those tables. Other Huffman tables,
-tANS, or multi-array composition still require a compatible `kraken.dll`,
-which is not distributed with this repository.
+16-symbol new-table forms and zero-based uniform 32-, 64-, and 128-symbol
+forms. Both one-partition (type 2) and two-partition (type 4) Huffman framing
+are supported for those tables. Other Huffman tables, tANS, or multi-array
+composition still require a compatible `kraken.dll`, which is not distributed
+with this repository.
 
 ## Features
 
