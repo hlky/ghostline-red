@@ -78,6 +78,14 @@ chunk forms:
 & $red kraken-decode '.\input.kraken' '.\roundtrip.bin' --size 1048576
 ```
 
+For differential diagnosis only, decoding can fall back to a native library
+inside the crash-isolated worker:
+
+```powershell
+& $red --kraken $kraken kraken-decode `
+  '.\input.kraken' '.\roundtrip.bin' --size 1048576 --native-fallback
+```
+
 The exact decoded size is required because raw Kraken block framing does not
 store it. Unknown entropy-compressed quantum forms fail closed with an explicit
 error; they are not guessed or partially decoded.

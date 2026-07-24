@@ -33,6 +33,9 @@ enum Command {
         /// Exact number of uncompressed bytes expected.
         #[arg(long)]
         size: usize,
+        /// Fall back to the crash-isolated native library when clean decoding is unsupported.
+        #[arg(long)]
+        native_fallback: bool,
     },
     /// Pack a loose depot tree into an archive.
     Pack {
@@ -135,11 +138,17 @@ fn main() -> Result<()> {
             input,
             output,
             size,
+            native_fallback,
         } => {
             let encoded =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let decoded = kraken::decode(&encoded, size)
-                .with_context(|| format!("failed to decode {}", input.display()))?;
+            let decoded = if native_fallback {
+                archive::decompress_payload_isolated(&encoded, size, cli.kraken.as_os_str())
+                    .with_context(|| format!("failed to decode {}", input.display()))?
+            } else {
+                kraken::decode(&encoded, size)
+                    .with_context(|| format!("failed to decode {}", input.display()))?
+            };
             fs::write(&output, decoded)
                 .with_context(|| format!("failed to write {}", output.display()))?;
         }

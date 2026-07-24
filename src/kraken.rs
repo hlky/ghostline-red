@@ -1179,7 +1179,10 @@ fn decode_rle(
             front += 1;
             back -= 1;
             continue;
-        } else if command >= 0x30 {
+        // Zero shares the compact command shape: it emits fifteen literals
+        // and no run. Native streams use it even though early interoperability
+        // notes only documented the >= 0x30 range.
+        } else if command == 0 || command >= 0x30 {
             back -= 1;
             (
                 usize::from(command.wrapping_neg().wrapping_sub(1) & 0xf),
@@ -1766,7 +1769,7 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::{
         BLOCK_SIZE, CHUNK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array,
-        decode_lz_payload, decode_quantum, decode_scaled_offset_value, encode,
+        decode_lz_payload, decode_quantum, decode_rle, decode_scaled_offset_value, encode,
         encode_contiguous_new_huffman_header, encode_extended_length, execute_lz_commands,
     };
 
@@ -2117,6 +2120,15 @@ mod tests {
             Ok(vec![0, b'A', 0, 0, 0])
         );
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_zero_byte_compact_rle_literal_command() {
+        let mut payload = vec![0];
+        payload.extend(1_u8..=15);
+        payload.push(0);
+
+        assert_eq!(decode_rle(&payload, 15, 0, 0), Ok((1_u8..=15).collect()));
     }
 
     #[test]
