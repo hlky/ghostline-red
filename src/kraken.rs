@@ -1585,10 +1585,6 @@ fn decode_recursive_arrays(
     Ok(output)
 }
 
-#[allow(
-    dead_code,
-    reason = "wired into quantum decoding once the paired-bit distance parser is implemented"
-)]
 #[expect(
     clippy::too_many_arguments,
     reason = "the side streams are explicit to make exact consumption auditable"
@@ -1708,7 +1704,6 @@ fn execute_lz_commands(
     Ok(())
 }
 
-#[allow(dead_code, reason = "used by the staged LZ command executor")]
 fn take_length(lengths: &[usize], cursor: &mut usize, offset: usize) -> Result<usize, KrakenError> {
     let value = lengths
         .get(*cursor)
@@ -1722,7 +1717,6 @@ fn take_length(lengths: &[usize], cursor: &mut usize, offset: usize) -> Result<u
     clippy::too_many_arguments,
     reason = "explicit cursors keep LZ side-stream consumption auditable"
 )]
-#[allow(dead_code, reason = "used by the staged LZ command executor")]
 fn emit_literals(
     output: &mut Vec<u8>,
     chunk_end: usize,
@@ -1762,7 +1756,6 @@ fn emit_literals(
     Ok(())
 }
 
-#[allow(dead_code, reason = "used by the staged LZ command executor")]
 fn copy_match(
     output: &mut Vec<u8>,
     chunk_end: usize,
@@ -1792,7 +1785,6 @@ fn copy_match(
     Ok(())
 }
 
-#[allow(dead_code, reason = "used by the staged LZ command executor")]
 fn history_index(
     output_position: usize,
     offset: i32,
@@ -1816,10 +1808,6 @@ fn history_index(
         })
 }
 
-#[allow(
-    dead_code,
-    reason = "staged paired-bit suffix decoder awaiting distance and length value grammars"
-)]
 struct PairedBits<'a> {
     bytes: &'a [u8],
     front_bits: usize,
@@ -1827,10 +1815,6 @@ struct PairedBits<'a> {
     stream_offset: usize,
 }
 
-#[allow(
-    dead_code,
-    reason = "staged paired-bit suffix decoder awaiting distance and length value grammars"
-)]
 impl<'a> PairedBits<'a> {
     const fn new(bytes: &'a [u8], stream_offset: usize) -> Self {
         Self {
