@@ -619,6 +619,10 @@ mod tests {
 
     #[test]
     #[ignore = "clean-room small entropy classifier; requires KRAKEN_DLL"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the ignored oracle probe keeps its labeled input matrix together"
+    )]
     fn print_oracle_small_entropy_streams() {
         use std::fmt::Write as _;
 
@@ -647,6 +651,44 @@ mod tests {
                 [left, right].into_iter().cycle().take(128).collect(),
             ));
         }
+        for &symbols in &[
+            [0_u8, 1_u8, 3_u8],
+            [1, 2, 3],
+            [10, 20, 200],
+            [126, 127, 255],
+            [0, 1, 4],
+            [0, 1, 10],
+            [0, 1, 255],
+            [0, 2, 255],
+            [0, 10, 255],
+            [1, 254, 255],
+            [10, 254, 255],
+        ] {
+            cases.push((
+                format!("triple-{}-{}-{}", symbols[0], symbols[1], symbols[2]),
+                symbols.into_iter().cycle().take(128).collect(),
+            ));
+        }
+        for &symbols in &[
+            [0_u8, 1_u8, 2_u8, 4_u8],
+            [1, 2, 3, 4],
+            [10, 20, 30, 200],
+            [125, 126, 127, 255],
+            [0, 1, 2, 10],
+            [0, 1, 10, 255],
+            [0, 1, 254, 255],
+            [0, 10, 254, 255],
+            [1, 253, 254, 255],
+            [10, 253, 254, 255],
+        ] {
+            cases.push((
+                format!(
+                    "quad-{}-{}-{}-{}",
+                    symbols[0], symbols[1], symbols[2], symbols[3]
+                ),
+                symbols.into_iter().cycle().take(128).collect(),
+            ));
+        }
         let mut binary_state = 0x9e37_79b9_u32;
         cases.push((
             "binary-random-128".to_owned(),
@@ -659,6 +701,49 @@ mod tests {
                 })
                 .collect(),
         ));
+        let mut triple_random: Vec<u8> = (0..128_usize)
+            .map(|index| u8::try_from(index % 3).unwrap())
+            .collect();
+        let mut triple_state = 0x243f_6a88_u32;
+        for index in (1..triple_random.len()).rev() {
+            triple_state ^= triple_state << 13;
+            triple_state ^= triple_state >> 17;
+            triple_state ^= triple_state << 5;
+            triple_random.swap(index, usize::try_from(triple_state).unwrap() % (index + 1));
+        }
+        cases.push(("triple-random-128".to_owned(), triple_random));
+        let mut quad_random: Vec<u8> = (0..128_usize)
+            .map(|index| u8::try_from(index % 4).unwrap())
+            .collect();
+        let mut quad_state = 0xb7e1_5163_u32;
+        for index in (1..quad_random.len()).rev() {
+            quad_state ^= quad_state << 13;
+            quad_state ^= quad_state >> 17;
+            quad_state ^= quad_state << 5;
+            quad_random.swap(index, usize::try_from(quad_state).unwrap() % (index + 1));
+        }
+        cases.push(("quad-random-128".to_owned(), quad_random));
+        for &(start, alphabet) in &[(1_u8, 5_u8), (10, 5), (1, 8), (10, 8), (1, 16), (100, 16)] {
+            cases.push((
+                format!("shifted{start}-alphabet{alphabet}-128"),
+                (0..128)
+                    .map(|index| start + u8::try_from(index % usize::from(alphabet)).unwrap())
+                    .collect(),
+            ));
+        }
+        for &(alphabet, seed) in &[(5_u8, 0xa409_3822_u32), (8, 0x299f_31d0)] {
+            let mut values: Vec<u8> = (0..128)
+                .map(|index| u8::try_from(index % usize::from(alphabet)).unwrap())
+                .collect();
+            let mut state = seed;
+            for index in (1..values.len()).rev() {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                values.swap(index, usize::try_from(state).unwrap() % (index + 1));
+            }
+            cases.push((format!("alphabet{alphabet}-random-128"), values));
+        }
         for (name, payload) in cases {
             let encoded = kraken.compress_validated(&payload).unwrap();
             let mut hex = String::new();
@@ -670,6 +755,38 @@ mod tests {
                 payload.len(),
                 encoded.len()
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room new Huffman table probe; requires KRAKEN_DLL"]
+    fn print_oracle_new_huffman_tables() {
+        use std::fmt::Write as _;
+
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for &alphabet in &[8_u8, 16] {
+            let bits = usize::try_from(alphabet.ilog2()).unwrap();
+            let stream_bytes = [43_usize, 42, 43]
+                .into_iter()
+                .map(|symbols| symbols.saturating_mul(bits).div_ceil(8))
+                .sum::<usize>();
+            for start in 0_u8..=u8::MAX - alphabet {
+                let payload: Vec<u8> = (0..128)
+                    .map(|index| start + u8::try_from(index % usize::from(alphabet)).unwrap())
+                    .collect();
+                let encoded = kraken.compress_validated(&payload).unwrap();
+                if encoded.get(5).is_none_or(|byte| (byte >> 4) & 7 != 2) {
+                    continue;
+                }
+                let table_start = 10;
+                let table_end = encoded.len() - stream_bytes - 2;
+                let mut hex = String::new();
+                for byte in &encoded[table_start..table_end] {
+                    write!(&mut hex, "{byte:02x}").unwrap();
+                }
+                println!("alphabet={alphabet} start={start} table={hex}");
+            }
         }
     }
 }

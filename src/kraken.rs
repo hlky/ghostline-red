@@ -595,100 +595,184 @@ fn decode_huffman_one_partition(
     decoded_size: usize,
     offset: usize,
 ) -> Result<Vec<u8>, KrakenError> {
-    // The old-table two-symbol form is useful on its own and, unlike the
-    // remaining table syntaxes, is completely determined by the controlled
-    // vectors: a fixed prefix, two ascending symbols, and a three-bit suffix.
-    // Keep this narrowly validated until the general code-length reader is
-    // implemented; accepting a similar-looking header would silently corrupt
-    // the three interleaved bitstreams.
-    let header = payload.get(..4).ok_or(KrakenError::Truncated { offset })?;
-    let value = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-    if value & 0xff80_0007 != 0x0080_0000 {
-        return Err(KrakenError::UnsupportedQuantum { offset });
-    }
-    let symbol0 =
-        u8::try_from((value >> 11) & 0xff).map_err(|_| KrakenError::InvalidArray { offset })?;
-    let symbol1 =
-        u8::try_from((value >> 3) & 0xff).map_err(|_| KrakenError::InvalidArray { offset })?;
-    if symbol0 >= symbol1 {
-        return Err(KrakenError::InvalidArray { offset });
-    }
-
+    let (table, table_size) = decode_old_huffman_table(payload, offset)?;
     let split_bytes = payload
-        .get(4..6)
-        .ok_or(KrakenError::Truncated { offset: offset + 4 })?;
+        .get(table_size..table_size + 2)
+        .ok_or(KrakenError::Truncated {
+            offset: offset + table_size,
+        })?;
     let first_len = usize::from(u16::from_le_bytes([split_bytes[0], split_bytes[1]]));
     let streams = payload
-        .get(6..)
-        .ok_or(KrakenError::Truncated { offset: offset + 6 })?;
-    let first_symbols = decoded_size.div_ceil(3);
-    let backward_symbols = decoded_size.saturating_add(1) / 3;
-    let second_symbols = decoded_size / 3;
-    let first_bytes = first_symbols.div_ceil(8);
-    let backward_bytes = backward_symbols.div_ceil(8);
-    let second_bytes = second_symbols.div_ceil(8);
-    if first_len != first_bytes
-        || streams.len()
-            != first_bytes
-                .checked_add(second_bytes)
-                .and_then(|size| size.checked_add(backward_bytes))
-                .ok_or(KrakenError::InvalidArray { offset })?
-    {
+        .get(table_size + 2..)
+        .ok_or(KrakenError::Truncated {
+            offset: offset + table_size + 2,
+        })?;
+    if first_len > streams.len() {
         return Err(KrakenError::InvalidArray { offset });
     }
 
-    let first = &streams[..first_bytes];
-    let second = &streams[first_bytes..first_bytes + second_bytes];
-    let backward = &streams[first_bytes + second_bytes..];
+    let first = &streams[..first_len];
+    let opposing = &streams[first_len..];
     let mut output = Vec::with_capacity(decoded_size);
-    let mut first_bit = 0_usize;
-    let mut second_bit = 0_usize;
-    let mut backward_bit = 0_usize;
+    let mut first_bits = HuffBits::new(first, false);
+    let mut second_bits = HuffBits::new(opposing, false);
+    let mut backward_bits = HuffBits::new(opposing, true);
     while output.len() < decoded_size {
-        output.push(huffman_binary_symbol(
-            first, first_bit, false, symbol0, symbol1,
-        ));
-        first_bit += 1;
+        output.push(table.decode(&mut first_bits, offset)?);
         if output.len() == decoded_size {
             break;
         }
-        output.push(huffman_binary_symbol(
-            backward,
-            backward_bit,
-            true,
-            symbol0,
-            symbol1,
-        ));
-        backward_bit += 1;
+        output.push(table.decode(&mut backward_bits, offset)?);
         if output.len() == decoded_size {
             break;
         }
-        output.push(huffman_binary_symbol(
-            second, second_bit, false, symbol0, symbol1,
-        ));
-        second_bit += 1;
+        output.push(table.decode(&mut second_bits, offset)?);
+    }
+    if first_bits.consumed_bytes() != first.len()
+        || second_bits
+            .consumed_bytes()
+            .checked_add(backward_bits.consumed_bytes())
+            != Some(opposing.len())
+    {
+        return Err(KrakenError::InvalidArray { offset });
     }
     Ok(output)
 }
 
-fn huffman_binary_symbol(
-    stream: &[u8],
-    bit_index: usize,
-    reverse_bytes: bool,
-    symbol0: u8,
-    symbol1: u8,
-) -> u8 {
-    let byte_index = bit_index / 8;
-    let byte = if reverse_bytes {
-        stream[stream.len() - 1 - byte_index]
-    } else {
-        stream[byte_index]
-    };
-    if byte >> (bit_index & 7) & 1 == 0 {
-        symbol0
-    } else {
-        symbol1
+struct OldHuffmanTable {
+    entries: Vec<(u16, u8, u8)>,
+}
+
+impl OldHuffmanTable {
+    fn decode(&self, bits: &mut HuffBits<'_>, offset: usize) -> Result<u8, KrakenError> {
+        let mut code = 0_u16;
+        for length in 1..=11_u8 {
+            code |= u16::from(bits.read(offset)?) << (length - 1);
+            if let Some(&(_, _, symbol)) = self
+                .entries
+                .iter()
+                .find(|&&(entry_code, entry_len, _)| entry_len == length && entry_code == code)
+            {
+                return Ok(symbol);
+            }
+        }
+        Err(KrakenError::InvalidArray { offset })
     }
+}
+
+struct HuffBits<'a> {
+    bytes: &'a [u8],
+    bit: usize,
+    reverse_bytes: bool,
+}
+
+impl<'a> HuffBits<'a> {
+    fn new(bytes: &'a [u8], reverse_bytes: bool) -> Self {
+        Self {
+            bytes,
+            bit: 0,
+            reverse_bytes,
+        }
+    }
+
+    fn read(&mut self, offset: usize) -> Result<u8, KrakenError> {
+        let byte_index = self.bit / 8;
+        let byte_index = if self.reverse_bytes {
+            self.bytes
+                .len()
+                .checked_sub(byte_index + 1)
+                .ok_or(KrakenError::Truncated { offset })?
+        } else {
+            byte_index
+        };
+        let byte = *self
+            .bytes
+            .get(byte_index)
+            .ok_or(KrakenError::Truncated { offset })?;
+        let value = byte >> (self.bit & 7) & 1;
+        self.bit += 1;
+        Ok(value)
+    }
+
+    fn consumed_bytes(&self) -> usize {
+        self.bit.div_ceil(8)
+    }
+}
+
+fn decode_old_huffman_table(
+    payload: &[u8],
+    offset: usize,
+) -> Result<(OldHuffmanTable, usize), KrakenError> {
+    if let Some(header) = payload.get(..4) {
+        let value = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let fields = (0xff_u32 << 11) | (0xff_u32 << 3);
+        if value & !fields == 0x0080_0000 {
+            let symbols = [((value >> 11) & 0xff) as u8, ((value >> 3) & 0xff) as u8];
+            if symbols[0] < symbols[1] {
+                return Ok((
+                    OldHuffmanTable {
+                        entries: vec![(0, 1, symbols[0]), (1, 1, symbols[1])],
+                    },
+                    4,
+                ));
+            }
+        }
+    }
+
+    if let Some(header) = payload.get(..5) {
+        let value = header.iter().fold(0_u64, |accumulator, &byte| {
+            accumulator << 8 | u64::from(byte)
+        });
+        let fields = (0xff_u64 << 19) | (0xff_u64 << 10) | (0xff_u64 << 1);
+        if value & !fields == 0x0000_c804_0001 {
+            let symbols = [
+                ((value >> 19) & 0xff) as u8,
+                ((value >> 10) & 0xff) as u8,
+                ((value >> 1) & 0xff) as u8,
+            ];
+            if symbols.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Ok((
+                    OldHuffmanTable {
+                        entries: vec![
+                            (0b01, 2, symbols[0]),
+                            (0, 1, symbols[1]),
+                            (0b11, 2, symbols[2]),
+                        ],
+                    },
+                    5,
+                ));
+            }
+        }
+    }
+
+    if let Some(header) = payload.get(..7) {
+        let value = header.iter().fold(0_u64, |accumulator, &byte| {
+            accumulator << 8 | u64::from(byte)
+        });
+        let fields = (0xff_u64 << 35) | (0xff_u64 << 26) | (0xff_u64 << 17) | (0xff_u64 << 8);
+        if value & !fields == 0x01_0804_0201_0080 {
+            let symbols = [
+                ((value >> 35) & 0xff) as u8,
+                ((value >> 26) & 0xff) as u8,
+                ((value >> 17) & 0xff) as u8,
+                ((value >> 8) & 0xff) as u8,
+            ];
+            if symbols.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Ok((
+                    OldHuffmanTable {
+                        entries: vec![
+                            (0b00, 2, symbols[0]),
+                            (0b10, 2, symbols[1]),
+                            (0b01, 2, symbols[2]),
+                            (0b11, 2, symbols[3]),
+                        ],
+                    },
+                    7,
+                ));
+            }
+        }
+    }
+    Err(KrakenError::UnsupportedQuantum { offset })
 }
 
 fn require_array_size(
@@ -1457,6 +1541,49 @@ mod tests {
         let mut cursor = Cursor::new(&bytes, 0);
         assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected));
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_old_table_three_and_four_symbol_huffman_arrays() {
+        let triple = [
+            0x20, 0x01, 0xfc, 0x00, 0x23, // type 2: 35 -> 128
+            0x00, 0xc8, 0x04, 0x04, 0x05, // old three-symbol table
+            0x09, 0x00, // first forward stream is nine bytes
+            0xfd, 0xf5, 0xb4, 0x37, 0xa9, 0x86, 0x36, 0xcf, 0x06, 0x73, 0xe7, 0xae, 0xeb, 0x28,
+            0x6b, 0x7c, 0x15, 0xf7, 0x01, 0xef, 0x52, 0xc0, 0xe9, 0x55, 0xae, 0xbe, 0xab, 0xd2,
+        ];
+        let mut expected_triple: Vec<u8> = (0..128_usize)
+            .map(|index| u8::try_from(index % 3).unwrap())
+            .collect();
+        deterministic_shuffle(&mut expected_triple, 0x243f_6a88);
+        let mut cursor = Cursor::new(&triple, 0);
+        assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected_triple));
+        assert!(cursor.is_empty());
+
+        let quad = [
+            0x20, 0x01, 0xfc, 0x00, 0x2a, // type 2: 42 -> 128
+            0x01, 0x08, 0x04, 0x06, 0x05, 0x03, 0x80, // old four-symbol table
+            0x0b, 0x00, // first forward stream is eleven bytes
+            0x9d, 0x30, 0xe3, 0x21, 0xf6, 0x13, 0x22, 0x94, 0xb2, 0x9b, 0x2a, 0xd8, 0x0d, 0xe5,
+            0x9e, 0xf7, 0x74, 0xe6, 0xaf, 0x93, 0xd1, 0x04, 0x24, 0x3c, 0x94, 0xb1, 0xf5, 0x9a,
+            0x07, 0x94, 0xfe, 0xb1, 0x00,
+        ];
+        let mut expected_quad: Vec<u8> = (0..128_usize)
+            .map(|index| u8::try_from(index % 4).unwrap())
+            .collect();
+        deterministic_shuffle(&mut expected_quad, 0xb7e1_5163);
+        let mut cursor = Cursor::new(&quad, 0);
+        assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected_quad));
+        assert!(cursor.is_empty());
+    }
+
+    fn deterministic_shuffle(values: &mut [u8], mut state: u32) {
+        for index in (1..values.len()).rev() {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            values.swap(index, usize::try_from(state).unwrap() % (index + 1));
+        }
     }
 
     #[test]
