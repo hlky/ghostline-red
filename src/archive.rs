@@ -1172,4 +1172,30 @@ mod tests {
 
         assert!(paths.is_empty());
     }
+
+    #[test]
+    fn clean_pack_and_extract_should_round_trip_compressed_payload() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        let depot = source.join("mod").join("test");
+        fs::create_dir_all(&depot).unwrap();
+        let seed: Vec<u8> = (0..97_u8)
+            .map(|value| value.wrapping_mul(73).wrapping_add(19))
+            .collect();
+        let payload: Vec<u8> = seed.iter().copied().cycle().take(64 * 1024).collect();
+        fs::write(depot.join("payload.ent"), &payload).unwrap();
+        let archive = workspace.path().join("payload.archive");
+
+        pack(&source, &archive, OsStr::new("missing-kraken.dll")).unwrap();
+        let index = read_archive(&archive).unwrap();
+        assert_eq!(index.entries.len(), 1);
+        assert!(index.entries[0].compressed_size < index.entries[0].size);
+
+        let extracted = workspace.path().join("extracted");
+        extract(&archive, &extracted, OsStr::new("missing-kraken.dll"), None).unwrap();
+        assert_eq!(
+            fs::read(extracted.join("mod").join("test").join("payload.ent")).unwrap(),
+            payload
+        );
+    }
 }
