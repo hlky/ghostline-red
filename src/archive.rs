@@ -907,6 +907,9 @@ fn read_custom_paths(path: &Path, length: u32) -> Result<Vec<String>, ArchiveErr
         result.push(String::from_utf8_lossy(&bytes[start..end]).into_owned());
         start = end + 1;
     }
+    if start != bytes.len() {
+        return Err(ArchiveError::InvalidIndex);
+    }
     Ok(result)
 }
 
@@ -968,6 +971,9 @@ fn decode_custom_paths(bytes: &[u8], count: u32) -> Result<Vec<String>, ArchiveE
             .ok_or(ArchiveError::InvalidIndex)?;
         result.push(String::from_utf8_lossy(&bytes[start..end]).into_owned());
         start = end + 1;
+    }
+    if start != bytes.len() {
+        return Err(ArchiveError::InvalidIndex);
     }
     Ok(result)
 }
@@ -1171,6 +1177,43 @@ mod tests {
             read_compressed_custom_paths(path.path(), OsStr::new("missing-kraken.dll")).unwrap();
 
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn clean_decoder_reads_compressed_lxrs_metadata_without_a_dll() {
+        let paths: Vec<String> = (0..128)
+            .map(|index| format!("mod/ghostline/shared/asset_{index:03}.ent"))
+            .collect();
+        let mut decoded = Vec::new();
+        for path in &paths {
+            decoded.extend_from_slice(path.as_bytes());
+            decoded.push(0);
+        }
+        let compressed = kraken::encode(&decoded);
+        assert!(compressed.len() < decoded.len());
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&[0_u8; EXTENDED_HEADER_SIZE]).unwrap();
+        write_u32(&mut file, LXRS_MAGIC).unwrap();
+        write_u32(&mut file, 1).unwrap();
+        write_u32(&mut file, u32::try_from(decoded.len()).unwrap()).unwrap();
+        write_u32(&mut file, u32::try_from(compressed.len()).unwrap()).unwrap();
+        write_u32(&mut file, u32::try_from(paths.len()).unwrap()).unwrap();
+        file.write_all(&compressed).unwrap();
+        file.flush().unwrap();
+
+        assert_eq!(
+            read_compressed_custom_paths(file.path(), OsStr::new("missing-kraken.dll")).unwrap(),
+            paths
+        );
+    }
+
+    #[test]
+    fn lxrs_path_decoder_rejects_trailing_bytes() {
+        assert!(matches!(
+            decode_custom_paths(b"mod/test.ent\0garbage", 1),
+            Err(ArchiveError::InvalidIndex)
+        ));
     }
 
     #[test]
