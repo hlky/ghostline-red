@@ -1079,4 +1079,53 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    #[ignore = "clean-room embedded entropy-array probe; requires KRAKEN_DLL and KRAKEN_FIXTURE"]
+    fn print_oracle_embedded_entropy_array() {
+        use std::fmt::Write as _;
+
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let fixture = env::var_os("KRAKEN_FIXTURE").map(PathBuf::from).unwrap();
+        let array_offset: usize = env::var("KRAKEN_ARRAY_OFFSET").unwrap().parse().unwrap();
+        let input = std::fs::read(fixture).unwrap();
+        let first = input[array_offset];
+        assert!(first < 0x80 && (1..=5).contains(&((first >> 4) & 7)));
+        let word = u32::from_be_bytes([
+            input[array_offset + 1],
+            input[array_offset + 2],
+            input[array_offset + 3],
+            input[array_offset + 4],
+        ]);
+        let compressed_size = usize::try_from(word & 0x3_ffff).unwrap();
+        let decoded_size =
+            usize::try_from(((word >> 18) | (u32::from(first) << 14)) & 0x3_ffff).unwrap() + 1;
+        let envelope = &input[array_offset..array_offset + 5 + compressed_size];
+        let mut framed = vec![0x8c, 0x06];
+        let quantum_size = u32::try_from(envelope.len() - 1).unwrap();
+        framed.extend_from_slice(&quantum_size.to_be_bytes()[1..]);
+        framed.extend_from_slice(envelope);
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let decoded = kraken.decompress(&framed, decoded_size).unwrap();
+        let mut frequencies = [0_usize; 256];
+        for &symbol in &decoded {
+            frequencies[usize::from(symbol)] += 1;
+        }
+        let mut summary = String::new();
+        for (symbol, count) in frequencies.into_iter().enumerate() {
+            if count != 0 {
+                write!(&mut summary, "{symbol:02x}:{count},").unwrap();
+            }
+        }
+        let recompressed = kraken.compress_validated(&decoded).unwrap();
+        println!(
+            "type={} compressed={compressed_size} decoded={decoded_size} frequencies={summary}",
+            (first >> 4) & 7
+        );
+        println!(
+            "original_head={:02x?} recompressed_head={:02x?}",
+            &envelope[..envelope.len().min(96)],
+            &recompressed[..recompressed.len().min(96)]
+        );
+    }
 }
