@@ -2179,16 +2179,7 @@ fn decode_recursive_arrays(
     let count = usize::from(count_byte & 0x7f);
     if count_byte & 0x80 != 0 {
         let source_count = usize::from(count_byte & 0x3f);
-        if source_count != 0 {
-            return Err(KrakenError::UnsupportedQuantum { offset });
-        }
-        let output = decode_array(&mut cursor, Some(decoded_size), depth)?;
-        if !cursor.is_empty() {
-            return Err(KrakenError::InvalidArray {
-                offset: cursor.absolute_offset(),
-            });
-        }
-        return Ok(output);
+        return decode_multi_array(&mut cursor, source_count, 1, decoded_size, offset, depth);
     }
     if count < 2 {
         return Err(KrakenError::UnsupportedQuantum { offset });
@@ -2205,6 +2196,131 @@ fn decode_recursive_arrays(
         return Err(KrakenError::InvalidArray {
             offset: cursor.absolute_offset(),
         });
+    }
+    Ok(output)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the indexed-array state machine stays linear so exact side-stream consumption is auditable"
+)]
+fn decode_multi_array(
+    cursor: &mut Cursor<'_>,
+    source_count: usize,
+    destination_count: usize,
+    decoded_size: usize,
+    offset: usize,
+    depth: usize,
+) -> Result<Vec<u8>, KrakenError> {
+    if source_count == 0 {
+        let output = decode_array(cursor, Some(decoded_size), depth)?;
+        if !cursor.is_empty() {
+            return Err(KrakenError::InvalidArray {
+                offset: cursor.absolute_offset(),
+            });
+        }
+        return Ok(output);
+    }
+    let mut sources = Vec::with_capacity(source_count);
+    for _ in 0..source_count {
+        sources.push(decode_array(cursor, None, depth)?);
+    }
+    let control = cursor.read_le16()?;
+    let combined = control & 0x8000 != 0;
+    let indexes = decode_array(cursor, None, depth)?;
+    if indexes.len() < destination_count {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    let (indexes, length_logs) = if combined {
+        let mut unpacked_indexes = Vec::with_capacity(indexes.len());
+        let mut logs = Vec::with_capacity(indexes.len());
+        for value in indexes {
+            unpacked_indexes.push(value & 0xf);
+            logs.push(value >> 4);
+        }
+        (unpacked_indexes, logs)
+    } else {
+        let length_count = indexes
+            .len()
+            .checked_sub(destination_count)
+            .ok_or(KrakenError::InvalidArray { offset })?;
+        let logs = decode_array(cursor, Some(length_count), depth)?;
+        if logs.iter().any(|&value| value > 16) {
+            return Err(KrakenError::InvalidArray { offset });
+        }
+        (indexes, logs)
+    };
+    if indexes.last() != Some(&0) {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    let bit_count = usize::from(control & 0x3fff);
+    let bit_offset = cursor.absolute_offset();
+    let bit_region = cursor.take(bit_count)?;
+    if !cursor.is_empty() {
+        return Err(KrakenError::InvalidArray {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    let mut bits = PairedBits::new(bit_region, bit_offset);
+    let mut lengths = Vec::with_capacity(length_logs.len());
+    for (index, &log) in length_logs.iter().enumerate() {
+        let value = if index & 1 == 0 {
+            bits.read_front(u32::from(log))
+        } else {
+            bits.read_back(u32::from(log))
+        }?;
+        lengths.push(usize::try_from(value).map_err(|_| KrakenError::InvalidArray { offset })?);
+    }
+    bits.require_no_unread_bytes()
+        .map_err(|_| KrakenError::InvalidArray { offset })?;
+
+    let mut source_positions = vec![0_usize; source_count];
+    let mut output = Vec::with_capacity(decoded_size);
+    let mut index_cursor = 0_usize;
+    let mut length_cursor = 0_usize;
+    for _ in 0..destination_count {
+        loop {
+            let source = *indexes
+                .get(index_cursor)
+                .ok_or(KrakenError::InvalidArray { offset })?;
+            index_cursor += 1;
+            if source == 0 {
+                if combined {
+                    length_cursor = length_cursor
+                        .checked_add(1)
+                        .ok_or(KrakenError::InvalidArray { offset })?;
+                }
+                break;
+            }
+            let source_index = usize::from(source)
+                .checked_sub(1)
+                .filter(|&value| value < sources.len())
+                .ok_or(KrakenError::InvalidArray { offset })?;
+            let length = *lengths
+                .get(length_cursor)
+                .ok_or(KrakenError::InvalidArray { offset })?;
+            length_cursor += 1;
+            let start = source_positions[source_index];
+            let end = start
+                .checked_add(length)
+                .filter(|&value| value <= sources[source_index].len())
+                .ok_or(KrakenError::InvalidArray { offset })?;
+            if output.len().saturating_add(length) > decoded_size {
+                return Err(KrakenError::InvalidArray { offset });
+            }
+            output.extend_from_slice(&sources[source_index][start..end]);
+            source_positions[source_index] = end;
+        }
+    }
+    if index_cursor != indexes.len()
+        || length_cursor != lengths.len()
+        || output.len() != decoded_size
+        || source_positions
+            .iter()
+            .zip(&sources)
+            .any(|(&position, source)| position != source.len())
+    {
+        return Err(KrakenError::InvalidArray { offset });
     }
     Ok(output)
 }
@@ -2673,6 +2789,11 @@ impl<'a> Cursor<'a> {
     fn read_be16(&mut self) -> Result<u16, KrakenError> {
         let bytes = self.take(2)?;
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_le16(&mut self) -> Result<u16, KrakenError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
     }
 
     fn read_be24(&mut self) -> Result<u32, KrakenError> {
@@ -3281,6 +3402,38 @@ mod tests {
         let mut cursor = Cursor::new(&bytes, 0);
         assert_eq!(decode_array(&mut cursor, Some(16), 0), Ok(vec![b'x'; 16]));
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_indexed_multi_array_composition() {
+        let prefix = [
+            0x82, // indexed composition with two temporary source arrays
+            0x00, 0x00, 0x03, b'a', b'b', b'c', // source 1
+            0x00, 0x00, 0x03, b'X', b'Y', b'Z', // source 2
+        ];
+        for (control, indexes, logs) in [
+            (
+                [0x02, 0x00],
+                &[0x00, 0x00, 0x03, 0x01, 0x02, 0x00][..],
+                &[0x00, 0x00, 0x02, 0x02, 0x02][..],
+            ),
+            (
+                [0x02, 0x80],
+                &[0x00, 0x00, 0x03, 0x21, 0x22, 0x00][..],
+                &[][..],
+            ),
+        ] {
+            let mut payload = prefix.to_vec();
+            payload.extend_from_slice(&control);
+            payload.extend_from_slice(indexes);
+            payload.extend_from_slice(logs);
+            payload.extend_from_slice(&[0xc0, 0xc0]);
+
+            assert_eq!(
+                super::decode_recursive_arrays(&payload, 6, 0, 1),
+                Ok(b"abcXYZ".to_vec())
+            );
+        }
     }
 
     #[test]
