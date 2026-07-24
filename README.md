@@ -5,9 +5,43 @@ resources. It provides focused command-line workflows for packing, extracting,
 listing, inspecting, serializing, and deserializing game resources without
 reimplementing WolvenKit's editors.
 
-The project is currently tested most heavily on Windows. Archive compression
-and compressed-buffer operations require a compatible `kraken.dll`, which is
-not distributed with this repository.
+The project is currently tested most heavily on Windows. Normal pack, extract,
+list, CR2W, and LXRS workflows do not require `kraken.dll`.
+
+The clean-room Kraken decoder implements stored and compressed block framing,
+both 128 KiB inner chunks, RLE, general old/new Huffman tables, one- and
+two-partition Huffman streams, tANS, recursive and indexed multi-array
+composition, both LZ modes, recent and explicit legacy distances, scaled
+offsets, paired front/back suffix streams, and extended literal/match lengths.
+Malformed streams fail closed with checked bounds and exact-consumption rules.
+
+The encoder independently chooses among raw, memset, general canonical
+Huffman, compact tANS, and greedy LZ representations. Its LZ matcher supports
+multiple explicit distances, scaled offsets, three-entry move-to-front
+recent-offset reuse, and extended lengths. An early stable-distance path keeps
+periodic resources fast. Encoder representation choice is intentionally
+smaller than the decoder grammar: indexed arrays and two-partition Huffman are
+composition/framing alternatives, not requirements for producing compatible
+streams.
+
+## Preliminary performance
+
+Whole-process measurements on an Intel Xeon E5-2686 v4, Windows, Rust 1.95.0
+release build, using a cached 32 MiB corpus with a 97-byte pseudorandom period:
+
+| Path | Warm throughput | Output size |
+|---|---:|---:|
+| Clean Rust encode | ~745 MiB/s | 31,872 bytes |
+| Native encode through isolated worker | ~123 MiB/s | 9,103 bytes |
+| Clean Rust decode | ~658 MiB/s | 32 MiB |
+
+The fixed-width matcher, stable-distance path, and bulk overlap-copy pass
+improved the same clean encode/decode measurements from approximately
+345/221 MiB/s. These numbers
+include process startup and cached file I/O and are intended as reproducible
+workflow comparisons, not cycle-level codec microbenchmarks. Compression ratio
+depends heavily on the corpus; the native encoder remains substantially
+stronger on general data.
 
 ## Features
 
@@ -21,6 +55,7 @@ not distributed with this repository.
 - Grow CName/import tables and template-backed handle export arrays.
 - Isolate native Kraken work in short-lived worker processes.
 - Validate every compressed payload immediately by decompression.
+- Encode and decode Kraken streams without a native library.
 
 ## Build
 
@@ -35,20 +70,54 @@ cargo build --release
 The resulting executable is
 `target\release\ghostline-red.exe` on Windows.
 
-For compressed archives, pass the DLL explicitly or place it in the working
-directory as `kraken.dll`:
+No DLL is needed for normal use. To run optional native differential checks,
+pass WolvenKit's library explicitly or place it in the working directory as
+`kraken.dll`:
 
 ```powershell
 $red = '.\target\release\ghostline-red.exe'
 $kraken = 'C:\Tools\WolvenKit\kraken.dll'
 ```
 
+The `--kraken` argument identifies the library for explicit native diagnostics
+and fallback paths. Payloads that do not benefit from clean compression are
+stored as ordinary uncompressed archive segments.
+
+## Clean-room Kraken commands
+
+Encode a compatible stream without a DLL:
+
+```powershell
+& $red kraken-encode '.\input.bin' '.\input.kraken'
+```
+
+Add `--native` to use the selected library in the crash-isolated worker when
+collecting differential compression vectors.
+
+Decode a compatible Kraken stream:
+
+```powershell
+& $red kraken-decode '.\input.kraken' '.\roundtrip.bin' --size 1048576
+```
+
+For differential diagnosis only, decoding can fall back to a native library
+inside the crash-isolated worker:
+
+```powershell
+& $red --kraken $kraken kraken-decode `
+  '.\input.kraken' '.\roundtrip.bin' --size 1048576 --native-fallback
+```
+
+The exact decoded size is required because raw Kraken block framing does not
+store it. Malformed or unknown quantum forms fail closed with an explicit
+error; they are not guessed or partially decoded.
+
 ## Archive commands
 
 Pack a loose depot tree:
 
 ```powershell
-& $red --kraken $kraken pack '.\source\archive' -o '.\build'
+& $red pack '.\source\archive' -o '.\build'
 ```
 
 If the source directory is named `archive`, this writes
@@ -57,10 +126,23 @@ If the source directory is named `archive`, this writes
 Extract an archive:
 
 ```powershell
-& $red --kraken $kraken extract `
+& $red extract `
   '.\build\archive.archive' `
   -o '.\build\extracted'
 ```
+
+Extract one exact depot path from a stock or mod archive (equivalent to
+`WolvenKit.CLI extract ... -w <path>`):
+
+```powershell
+& $red extract `
+  'H:\Cyberpunk 2077\archive\pc\content\basegame_3_nightcity.archive' `
+  -o '.\extracted' `
+  -w 'base\worlds\03_night_city\_compiled\default\03_night_city.streamingworld'
+```
+
+Scoped extraction hashes the supplied path directly, so it does not need an
+embedded LXRS path table or `--paths-root`.
 
 List its index:
 
@@ -95,7 +177,7 @@ Inspect a CR2W resource:
 Serialize binary CR2W to recursive WKit-shaped JSON:
 
 ```powershell
-& $red --kraken $kraken cr2w-serialize `
+& $red cr2w-serialize `
   '.\example.questphase' `
   '.\example.questphase.json' `
   --schema '.\red-schema.json'
@@ -105,7 +187,7 @@ Deserialize JSON using an existing same-kind CR2W resource as its audited
 layout template:
 
 ```powershell
-& $red --kraken $kraken cr2w-deserialize `
+& $red cr2w-deserialize `
   '.\example.questphase.json' `
   '.\rebuilt.questphase' `
   --template '.\example.questphase' `
@@ -160,14 +242,20 @@ cargo test --all-features
 
 ## Validation and performance
 
-The implementation was originally validated against:
+The implementation is validated against:
 
 - 80 authored CR2W resources with byte-identical binary → JSON → binary
   round trips;
 - eight typed RedPackage-bearing resources;
 - a 301-file archive with byte-identical pack/extract payloads;
 - independent extraction and serialization by WolvenKit 8.17.4;
-- a base-game `03_night_city.streamingworld` fixture.
+- a base-game `03_night_city.streamingworld` fixture;
+- all 186 compressed segments in `basegame_2_mainmenu.archive`, byte-for-byte
+  against WolvenKit's native decoder;
+- sampled 10,000-segment windows at the start, middle, and late portions of
+  `basegame_3_nightcity.archive`;
+- clean/native encoder compatibility vectors covering general sparse Huffman,
+  compact tANS, multiple LZ distances, scaled offsets, and extended lengths.
 
 Representative warm command-line measurements from the development machine:
 
@@ -177,8 +265,14 @@ Representative warm command-line measurements from the development machine:
 | Questphase deserialize | 89.7 ms | 16.92 s |
 | Streamingworld serialize | 85.5 ms | 18.69 s |
 | Streamingworld deserialize | 81.2 ms | 17.81 s |
-| 301-file archive pack | 2.72 s | 9.71 s |
-| 301-file archive extract | 0.52 s | 8.30 s |
+| 302-file archive pack | 1.27 s | 10.00 s |
+| 302-file archive extract | 0.63 s | 8.07 s |
+
+The current 305-input Ghostline tree (302 packable resources after excluding
+temporary/readme files) completed a DLL-free pack in 1.27 s and extract in
+0.63 s with zero SHA-256 mismatches. A fresh stock streamingworld scoped
+extract took 115 ms; serialize and deserialize took 96 ms and 99 ms, and the
+rebuilt CR2W was byte-identical.
 
 These figures include process startup and describe one machine and fixture
 set; they are not universal guarantees.

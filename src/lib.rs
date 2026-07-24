@@ -3,6 +3,7 @@
 pub mod archive;
 pub mod codec;
 pub mod cr2w;
+pub mod kraken;
 pub mod localization;
 pub mod redpackage;
 pub mod schema;

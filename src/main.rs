@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ghostline_red::{archive, codec, cr2w, localization, schema, writer};
+use ghostline_red::{archive, codec, cr2w, kraken, localization, schema, writer};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
@@ -24,6 +24,25 @@ enum Command {
     KrakenCompressWorker,
     #[command(hide = true)]
     KrakenDecompressWorker,
+    /// Encode a DLL-free Kraken stream with entropy and LZ compression.
+    KrakenEncode {
+        input: PathBuf,
+        output: PathBuf,
+        /// Prefer the crash-isolated native compressor for differential diagnosis.
+        #[arg(long)]
+        native: bool,
+    },
+    /// Decode a Kraken stream with the clean-room backend.
+    KrakenDecode {
+        input: PathBuf,
+        output: PathBuf,
+        /// Exact number of uncompressed bytes expected.
+        #[arg(long)]
+        size: usize,
+        /// Fall back to the crash-isolated native library when clean decoding is unsupported.
+        #[arg(long)]
+        native_fallback: bool,
+    },
     /// Pack a loose depot tree into an archive.
     Pack {
         source: PathBuf,
@@ -35,6 +54,9 @@ enum Command {
         archive: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
+        /// Extract only this exact depot path (`WolvenKit` `-w` equivalent).
+        #[arg(short = 'w', long)]
+        path: Option<String>,
         /// Resolve native hashes from files beneath this depot root.
         #[arg(long)]
         paths_root: Option<PathBuf>,
@@ -111,6 +133,39 @@ fn main() -> Result<()> {
             let output = archive::decompress_worker(&input, cli.kraken.as_os_str())?;
             std::io::stdout().write_all(&output)?;
         }
+        Command::KrakenEncode {
+            input,
+            output,
+            native,
+        } => {
+            let decoded =
+                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
+            let encoded = if native {
+                archive::compress_payload_isolated(&decoded, cli.kraken.as_os_str())
+            } else {
+                kraken::encode(&decoded)
+            };
+            fs::write(&output, encoded)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+        }
+        Command::KrakenDecode {
+            input,
+            output,
+            size,
+            native_fallback,
+        } => {
+            let encoded =
+                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
+            let decoded = if native_fallback {
+                archive::decompress_payload_isolated(&encoded, size, cli.kraken.as_os_str())
+                    .with_context(|| format!("failed to decode {}", input.display()))?
+            } else {
+                kraken::decode(&encoded, size)
+                    .with_context(|| format!("failed to decode {}", input.display()))?
+            };
+            fs::write(&output, decoded)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+        }
         Command::Pack { source, output } => {
             fs::create_dir_all(&output)?;
             let name = source
@@ -124,15 +179,20 @@ fn main() -> Result<()> {
         Command::Extract {
             archive: path,
             output,
+            path: depot_path,
             paths_root,
         } => {
             fs::create_dir_all(&output)?;
-            archive::extract(
-                &path,
-                &output,
-                cli.kraken.as_os_str(),
-                paths_root.as_deref(),
-            )?;
+            if let Some(depot_path) = depot_path {
+                archive::extract_path(&path, &output, &depot_path, cli.kraken.as_os_str())?;
+            } else {
+                archive::extract(
+                    &path,
+                    &output,
+                    cli.kraken.as_os_str(),
+                    paths_root.as_deref(),
+                )?;
+            }
         }
         Command::ArchiveList {
             archive: path,
