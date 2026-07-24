@@ -24,7 +24,7 @@ enum Command {
     KrakenCompressWorker,
     #[command(hide = true)]
     KrakenDecompressWorker,
-    /// Encode a DLL-free Kraken stream (raw blocks, with constant-block compression).
+    /// Encode a DLL-free Kraken stream with entropy and LZ compression.
     KrakenEncode {
         input: PathBuf,
         output: PathBuf,
@@ -32,7 +32,7 @@ enum Command {
         #[arg(long)]
         native: bool,
     },
-    /// Decode a DLL-free Kraken stream supported by the clean-room backend.
+    /// Decode a Kraken stream with the clean-room backend.
     KrakenDecode {
         input: PathBuf,
         output: PathBuf,

@@ -1,10 +1,12 @@
-//! Implements the DLL-free subset of the Oodle Kraken byte stream.
+//! Implements a DLL-free interoperable Oodle Kraken byte stream.
 //!
 //! Streams are divided into independent 256 KiB blocks. This module emits
-//! standards-compatible raw, constant-byte, low-cardinality Huffman, and
-//! deterministic recent-offset LZ blocks. The decoder additionally accepts
-//! stored, RLE, recursive, and the implemented Huffman array forms.
+//! compatible raw, constant-byte, general Huffman, compact tANS, and
+//! deterministic LZ blocks. The decoder also accepts general old/new Huffman,
+//! tANS, RLE, recursive/indexed array composition, both LZ modes, and their
+//! paired offset and extended-length metadata.
 
+use std::{cmp::Reverse, collections::BinaryHeap};
 use thiserror::Error;
 
 const BLOCK_SIZE: usize = 256 * 1024;
@@ -39,9 +41,8 @@ pub enum KrakenError {
 
 /// Encodes bytes as a compatible Kraken stream without proprietary code.
 ///
-/// Constant blocks use Kraken's compact memset quantum. Low-cardinality blocks
-/// use deterministic Huffman arrays, period-eight data uses a compact LZ
-/// representation, and other blocks use the uncompressed representation.
+/// The encoder chooses the smallest compatible candidate among compact memset,
+/// canonical Huffman, compact tANS, greedy LZ, and uncompressed blocks.
 #[must_use]
 pub fn encode(input: &[u8]) -> Vec<u8> {
     if input.len() >= 288
@@ -54,8 +55,14 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
     {
         return encode_period_eight_stream(input);
     }
-    let huffman = encode_huffman_stream(input);
     let greedy = encode_greedy_lz_stream(input);
+    if let Some(encoded) = greedy.as_ref()
+        && encoded.len().saturating_mul(8) < input.len()
+        && input.windows(2).any(|pair| pair[0] != pair[1])
+    {
+        return encoded.clone();
+    }
+    let huffman = encode_huffman_stream(input);
     if let Some(encoded) = [huffman, greedy].into_iter().flatten().min_by_key(Vec::len) {
         return encoded;
     }
@@ -789,16 +796,20 @@ fn huffman_code_lengths(symbols: &[u8], frequencies: &[usize; 256]) -> Option<Ve
         .map(|&symbol| frequencies[usize::from(symbol)])
         .collect();
     let mut parents = vec![usize::MAX; leaf_count * 2 - 1];
-    let mut active: Vec<usize> = (0..leaf_count).collect();
+    let mut active: BinaryHeap<Reverse<(usize, usize)>> = weights
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(node, weight)| Reverse((weight, node)))
+        .collect();
     while active.len() > 1 {
-        active.sort_unstable_by_key(|&node| (weights[node], node));
-        let first = active.remove(0);
-        let second = active.remove(0);
+        let Reverse((_, first)) = active.pop()?;
+        let Reverse((_, second)) = active.pop()?;
         let parent = weights.len();
         weights.push(weights[first].checked_add(weights[second])?);
         parents[first] = parent;
         parents[second] = parent;
-        active.push(parent);
+        active.push(Reverse((weights[parent], parent)));
     }
     let mut lengths = Vec::with_capacity(leaf_count);
     for leaf in 0..leaf_count {
@@ -3373,6 +3384,23 @@ mod tests {
             decode(&[0, 0], 1),
             Err(KrakenError::InvalidHeader { offset: 0 })
         );
+    }
+
+    #[test]
+    fn arbitrary_malformed_streams_fail_without_panicking() {
+        let mut state = 0x9e37_79b9_u32;
+        for case in 0..2_000_usize {
+            let length = case % 129;
+            let mut bytes = Vec::with_capacity(length);
+            for _ in 0..length {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                bytes.push(state.to_le_bytes()[0]);
+            }
+            let decoded_size = state as usize % 4_097;
+            let _ = decode(&bytes, decoded_size);
+        }
     }
 
     #[test]
