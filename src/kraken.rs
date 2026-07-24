@@ -98,7 +98,9 @@ fn encode_greedy_lz_block(block: &[u8], absolute_offset: usize) -> Option<Vec<u8
     let mut chunk_offset = 0_usize;
     for chunk in block.chunks(CHUNK_SIZE) {
         let has_initial_history = absolute_offset + chunk_offset == 0;
-        if let Some(lz) = encode_single_offset_lz_chunk(chunk, has_initial_history) {
+        let lz = encode_stable_distance_lz_chunk(chunk, has_initial_history)
+            .or_else(|| encode_greedy_lz_chunk(chunk, has_initial_history));
+        if let Some(lz) = lz {
             write_be24(&mut quantum, 0x88_0000 | u32::try_from(lz.len()).ok()?);
             quantum.extend_from_slice(&lz);
         } else {
@@ -120,15 +122,14 @@ fn encode_greedy_lz_block(block: &[u8], absolute_offset: usize) -> Option<Vec<u8
     Some(output)
 }
 
-fn encode_single_offset_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Option<Vec<u8>> {
+fn encode_stable_distance_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Option<Vec<u8>> {
     let start = usize::from(has_initial_history) * 8;
     if chunk.len() < start + 8 {
         return None;
     }
-    let search_end = chunk.len();
     let mut latest = vec![u32::MAX; 1 << 16];
     let mut selected = None;
-    for position in 0..search_end.saturating_sub(3) {
+    for position in 0..chunk.len().saturating_sub(3) {
         let key = hash_four_bytes(chunk.get(position..position + 4)?);
         let previous = latest[key];
         latest[key] = u32::try_from(position).ok()?;
@@ -138,14 +139,18 @@ fn encode_single_offset_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Opt
         let previous = usize::try_from(previous).ok()?;
         let distance = position - previous;
         if (8..=0x3fff).contains(&distance)
-            && common_prefix_length(&chunk[previous..], &chunk[position..], 4) >= 4
+            && common_prefix_length(
+                &chunk[previous..],
+                &chunk[position..],
+                chunk.len() - position,
+            ) == chunk.len() - position
         {
             selected = Some(distance);
             break;
         }
     }
     let distance = selected?;
-    let (packed_offset, offset_extra, offset_bits) = encode_scaled_offset(distance)?;
+    let offset = encode_scaled_offset(distance)?;
     let mut literals = Vec::new();
     let mut commands = Vec::new();
     let mut packed_lengths = Vec::new();
@@ -199,6 +204,88 @@ fn encode_single_offset_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Opt
         return None;
     }
     literals.extend_from_slice(&chunk[literal_start..]);
+    let mut lz = Vec::new();
+    if has_initial_history {
+        lz.extend_from_slice(&chunk[..8]);
+    }
+    encode_stored_array(&mut lz, &literals);
+    encode_stored_array(&mut lz, &commands);
+    lz.push(128);
+    encode_stored_array(&mut lz, &[offset.0]);
+    encode_stored_array(&mut lz, &packed_lengths);
+    append_lz_suffix(&mut lz, &[(offset.1, offset.2)], &extended_lengths);
+    (lz.len() < chunk.len()).then_some(lz)
+}
+
+fn encode_greedy_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Option<Vec<u8>> {
+    let start = usize::from(has_initial_history) * 8;
+    if chunk.len() < start + 8 {
+        return None;
+    }
+    let previous = build_previous_matches(chunk)?;
+    let mut literals = Vec::new();
+    let mut commands = Vec::new();
+    let mut packed_offsets = Vec::new();
+    let mut offset_suffixes = Vec::new();
+    let mut packed_lengths = Vec::new();
+    let mut extended_lengths = Vec::new();
+    let mut recent = [8_usize; 3];
+    let mut position = start;
+    let mut literal_start = start;
+    while position + 4 <= chunk.len() {
+        let (best_distance, best_length) = find_best_match(chunk, &previous, position, &recent)?;
+        if best_length < 4 {
+            position += 1;
+            continue;
+        }
+        let literal_length = position - literal_start;
+        literals.extend_from_slice(&chunk[literal_start..position]);
+        let literal_code = if literal_length < 3 {
+            u8::try_from(literal_length).ok()?
+        } else if literal_length <= 257 {
+            packed_lengths.push(u8::try_from(literal_length - 3).ok()?);
+            3
+        } else {
+            packed_lengths.push(255);
+            extended_lengths.push(literal_length - 258);
+            3
+        };
+        let match_code = if best_length <= 16 {
+            u8::try_from(best_length - 2).ok()?
+        } else if best_length <= 271 {
+            packed_lengths.push(u8::try_from(best_length - 17).ok()?);
+            15
+        } else {
+            packed_lengths.push(255);
+            extended_lengths.push(best_length - 272);
+            15
+        };
+        let offset_index = if let Some(index) = recent
+            .iter()
+            .position(|&distance| distance == best_distance)
+        {
+            match index {
+                0 => {}
+                1 => recent.swap(0, 1),
+                2 => recent = [recent[2], recent[0], recent[1]],
+                _ => unreachable!("recent-offset table has exactly three entries"),
+            }
+            u8::try_from(index).ok()?
+        } else {
+            let (packed, extra, bits) = encode_scaled_offset(best_distance)?;
+            packed_offsets.push(packed);
+            offset_suffixes.push((extra, bits));
+            recent = [best_distance, recent[0], recent[1]];
+            3
+        };
+        commands.push(offset_index << 6 | match_code << 2 | literal_code);
+        position += best_length;
+        literal_start = position;
+    }
+    if commands.is_empty() {
+        return None;
+    }
+    literals.extend_from_slice(&chunk[literal_start..]);
 
     let mut lz = Vec::new();
     if has_initial_history {
@@ -207,10 +294,56 @@ fn encode_single_offset_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Opt
     encode_stored_array(&mut lz, &literals);
     encode_stored_array(&mut lz, &commands);
     lz.push(128);
-    encode_stored_array(&mut lz, &[packed_offset]);
+    encode_stored_array(&mut lz, &packed_offsets);
     encode_stored_array(&mut lz, &packed_lengths);
-    append_single_offset_suffix(&mut lz, offset_extra, offset_bits, &extended_lengths);
+    append_lz_suffix(&mut lz, &offset_suffixes, &extended_lengths);
     (lz.len() < chunk.len()).then_some(lz)
+}
+
+fn build_previous_matches(chunk: &[u8]) -> Option<Vec<u32>> {
+    let mut latest = vec![u32::MAX; 1 << 16];
+    let mut previous = vec![u32::MAX; chunk.len()];
+    let count = chunk.len().saturating_sub(3);
+    for (position, prior) in previous.iter_mut().enumerate().take(count) {
+        let key = hash_four_bytes(chunk.get(position..position + 4)?);
+        *prior = latest[key];
+        latest[key] = u32::try_from(position).ok()?;
+    }
+    Some(previous)
+}
+
+fn find_best_match(
+    chunk: &[u8],
+    previous: &[u32],
+    position: usize,
+    recent: &[usize; 3],
+) -> Option<(usize, usize)> {
+    let mut best = (0_usize, 0_usize);
+    for &distance in recent {
+        if position >= distance {
+            let length = common_prefix_length(
+                &chunk[position - distance..],
+                &chunk[position..],
+                chunk.len() - position,
+            );
+            if length > best.1 {
+                best = (distance, length);
+            }
+        }
+    }
+    let prior = *previous.get(position)?;
+    if prior != u32::MAX {
+        let prior = usize::try_from(prior).ok()?;
+        let distance = position - prior;
+        if (8..=0x3fff).contains(&distance) {
+            let length =
+                common_prefix_length(&chunk[prior..], &chunk[position..], chunk.len() - position);
+            if length > best.1 {
+                best = (distance, length);
+            }
+        }
+    }
+    Some(best)
 }
 
 fn hash_four_bytes(bytes: &[u8]) -> usize {
@@ -258,16 +391,17 @@ fn encode_scaled_offset(distance: usize) -> Option<(u8, u32, u8)> {
     Some((command, extra, u8::try_from(bit_count).ok()?))
 }
 
-fn append_single_offset_suffix(
-    output: &mut Vec<u8>,
-    extra: u32,
-    bit_count: u8,
-    extended_lengths: &[usize],
-) {
+fn append_lz_suffix(output: &mut Vec<u8>, offsets: &[(u32, u8)], extended_lengths: &[usize]) {
     let mut front = MsbBits::new();
-    front.push_value(extra, u32::from(bit_count));
     let mut back = MsbBits::new();
     back.push_gamma(extended_lengths.len() + 1);
+    for (index, &(extra, bit_count)) in offsets.iter().enumerate() {
+        if index & 1 == 0 {
+            front.push_value(extra, u32::from(bit_count));
+        } else {
+            back.push_value(extra, u32::from(bit_count));
+        }
+    }
     for (index, &value) in extended_lengths.iter().enumerate() {
         if index & 1 == 0 {
             front.push_extended_length(value);
@@ -2094,8 +2228,8 @@ mod tests {
         BLOCK_SIZE, CHUNK_SIZE, COMPRESSED_BLOCK_HEADER, Cursor, KrakenError, LsbWriter,
         PairedBits, canonical_huffman_table, decode, decode_array, decode_lz_payload,
         decode_quantum, decode_rle, decode_scaled_offset_value, encode, encode_array_envelope,
-        encode_contiguous_new_huffman_header, encode_extended_length,
-        encode_single_offset_lz_chunk, execute_lz_commands,
+        encode_contiguous_new_huffman_header, encode_extended_length, encode_greedy_lz_chunk,
+        execute_lz_commands,
     };
 
     #[test]
@@ -2166,10 +2300,53 @@ mod tests {
     }
 
     #[test]
+    fn greedy_lz_uses_multiple_explicit_offsets() {
+        fn bytes(seed: u32, count: usize) -> Vec<u8> {
+            let mut state = seed;
+            (0..count)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state.to_le_bytes()[0]
+                })
+                .collect()
+        }
+
+        let initial = bytes(0x243f_6a88, 8);
+        let first = bytes(0x85a3_08d3, 64);
+        let second = bytes(0x1319_8a2e, 80);
+        let third = bytes(0x0370_7344, 96);
+        let mut payload = initial;
+        payload.extend_from_slice(&first);
+        payload.extend_from_slice(&second);
+        payload.extend_from_slice(&first);
+        payload.extend_from_slice(&third);
+        payload.extend_from_slice(&second);
+        payload.extend_from_slice(&third);
+
+        let lz = encode_greedy_lz_chunk(&payload, true).unwrap();
+        let mut cursor = Cursor::new(&lz, 0);
+        cursor.advance(8).unwrap();
+        decode_array(&mut cursor, None, 0).unwrap();
+        decode_array(&mut cursor, None, 0).unwrap();
+        assert_eq!(cursor.read_byte(), Ok(128));
+        let packed_offsets = decode_array(&mut cursor, None, 0).unwrap();
+
+        assert!(packed_offsets.len() >= 2);
+        let mut output = Vec::new();
+        assert_eq!(
+            decode_lz_payload(&lz, payload.len(), &mut output, 1, 0),
+            Ok(())
+        );
+        assert_eq!(output, payload);
+    }
+
+    #[test]
     fn rejects_unread_lz_suffix_bytes() {
         let seed: Vec<u8> = (0..17_u8).map(|value| value.wrapping_mul(31)).collect();
         let payload: Vec<u8> = seed.iter().copied().cycle().take(1_024).collect();
-        let lz = encode_single_offset_lz_chunk(&payload, true).unwrap();
+        let lz = encode_greedy_lz_chunk(&payload, true).unwrap();
         let mut output = Vec::new();
         assert_eq!(
             decode_lz_payload(&lz, payload.len(), &mut output, 1, 0),

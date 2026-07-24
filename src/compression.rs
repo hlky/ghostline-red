@@ -10,6 +10,7 @@ use thiserror::Error;
 
 type CompressFn = unsafe extern "system" fn(*const u8, i64, *mut u8, c_int) -> c_int;
 type DecompressFn = unsafe extern "system" fn(*const u8, i64, *mut u8, i64) -> c_int;
+const NATIVE_GUARD_BYTES: usize = 64;
 
 #[derive(Debug, Error)]
 pub enum CompressionError {
@@ -81,11 +82,27 @@ impl Kraken {
     ) -> Result<Vec<u8>, CompressionError> {
         let input_len = i64::try_from(input.len()).map_err(|_| CompressionError::TooLarge)?;
         let output_len = i64::try_from(expected_size).map_err(|_| CompressionError::TooLarge)?;
-        let mut output = vec![0_u8; expected_size];
-        // SAFETY: Input and output point to live, non-overlapping slices. Exact
-        // allocated lengths are supplied and Kraken is required to honor them.
+        let guarded_input_len = input
+            .len()
+            .checked_add(NATIVE_GUARD_BYTES)
+            .ok_or(CompressionError::TooLarge)?;
+        let mut guarded_input = Vec::with_capacity(guarded_input_len);
+        guarded_input.extend_from_slice(input);
+        guarded_input.resize(guarded_input_len, 0);
+        let guarded_output_len = expected_size
+            .checked_add(NATIVE_GUARD_BYTES)
+            .ok_or(CompressionError::TooLarge)?;
+        let mut output = vec![0_u8; guarded_output_len];
+        // SAFETY: Input and output point to live, non-overlapping allocations
+        // with 64-byte guards for the native decoder's documented speculative
+        // boundary accesses. The ABI still receives the exact logical lengths.
         let actual = unsafe {
-            (self.decompress_fn)(input.as_ptr(), input_len, output.as_mut_ptr(), output_len)
+            (self.decompress_fn)(
+                guarded_input.as_ptr(),
+                input_len,
+                output.as_mut_ptr(),
+                output_len,
+            )
         };
         if actual != c_int::try_from(expected_size).map_err(|_| CompressionError::TooLarge)? {
             return Err(CompressionError::WrongSize {
@@ -93,6 +110,7 @@ impl Kraken {
                 expected: expected_size,
             });
         }
+        output.truncate(expected_size);
         Ok(output)
     }
 }
@@ -289,6 +307,10 @@ mod tests {
 
     #[test]
     #[ignore = "clean-room compatibility test; requires KRAKEN_DLL"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one compatibility matrix shares expensive native-library setup"
+    )]
     fn native_decoder_accepts_clean_room_encoder() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
         let kraken = Kraken::load(path.as_os_str()).unwrap();
@@ -332,6 +354,24 @@ mod tests {
             .cycle()
             .take(262_144 + 512)
             .collect();
+        let mut multi_offset = Vec::new();
+        for &(seed, count) in &[
+            (0x243f_6a88_u32, 8_usize),
+            (0x85a3_08d3, 64),
+            (0x1319_8a2e, 80),
+            (0x85a3_08d3, 64),
+            (0x0370_7344, 96),
+            (0x1319_8a2e, 80),
+            (0x0370_7344, 96),
+        ] {
+            let mut state = seed;
+            multi_offset.extend((0..count).map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            }));
+        }
         let entropy_cases = [2_u8, 3, 4, 5, 8, 16, 32, 64, 128].map(|alphabet| {
             let mut state = 0x510e_527f_u32 ^ u32::from(alphabet);
             (0..262_144 + 512)
@@ -363,6 +403,7 @@ mod tests {
             period,
             generic_period,
             generic_large_period,
+            multi_offset,
         ]
         .into_iter()
         .chain(entropy_cases)
