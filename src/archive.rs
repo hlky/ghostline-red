@@ -1250,24 +1250,33 @@ mod tests {
         let mut archive = fs::File::open(path).unwrap();
         let native = std::env::var_os("KRAKEN_DLL")
             .map(|path| crate::compression::Kraken::load(OsStr::new(&path)).unwrap());
+        let segment_start = std::env::var("ARCHIVE_SEGMENT_START")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let segment_count = std::env::var("ARCHIVE_SEGMENT_COUNT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(usize::MAX);
         let mut failures = Vec::new();
         let mut decoded = 0_usize;
-        for (segment_index, &segment) in index.segments.iter().enumerate() {
+        for (segment_index, &segment) in index
+            .segments
+            .iter()
+            .enumerate()
+            .skip(segment_start)
+            .take(segment_count)
+        {
             if segment.compressed_size == segment.size {
                 continue;
             }
-            match read_segment(
-                &mut archive,
-                segment,
-                OsStr::new("intentionally-missing-kraken.dll"),
-                true,
-            ) {
+            archive.seek(SeekFrom::Start(segment.offset)).unwrap();
+            let mut encoded = vec![0; usize::try_from(segment.compressed_size).unwrap()];
+            archive.read_exact(&mut encoded).unwrap();
+            let declared = read_u32_at(&encoded, 4).unwrap();
+            match kraken::decode(&encoded[8..], usize::try_from(declared).unwrap()) {
                 Ok(bytes) if bytes.len() == usize::try_from(segment.size).unwrap() => {
                     if let Some(native) = &native {
-                        archive.seek(SeekFrom::Start(segment.offset)).unwrap();
-                        let mut encoded =
-                            vec![0; usize::try_from(segment.compressed_size).unwrap()];
-                        archive.read_exact(&mut encoded).unwrap();
                         let expected = native
                             .decompress(&encoded[8..], usize::try_from(segment.size).unwrap())
                             .unwrap();
@@ -1280,12 +1289,15 @@ mod tests {
                     }
                     decoded += 1;
                 }
-                Ok(bytes) => failures.push(format!(
+                Ok(bytes) if failures.len() < 100 => failures.push(format!(
                     "segment {segment_index}: decoded {} of {} bytes",
                     bytes.len(),
                     segment.size
                 )),
-                Err(error) => failures.push(format!("segment {segment_index}: {error}")),
+                Err(error) if failures.len() < 100 => {
+                    failures.push(format!("segment {segment_index}: {error}"));
+                }
+                _ => {}
             }
         }
         assert!(

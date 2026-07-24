@@ -1342,79 +1342,79 @@ fn decode_huffman_table(
     payload: &[u8],
     offset: usize,
 ) -> Result<(OldHuffmanTable, usize), KrakenError> {
-    if let Some(header) = payload.get(..4) {
-        let value = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-        let fields = (0xff_u32 << 11) | (0xff_u32 << 3);
-        if value & !fields == 0x0080_0000 {
-            let symbols = [((value >> 11) & 0xff) as u8, ((value >> 3) & 0xff) as u8];
-            if symbols[0] < symbols[1] {
-                return Ok((
-                    OldHuffmanTable {
-                        entries: vec![(0, 1, symbols[0]), (1, 1, symbols[1])],
-                    },
-                    4,
-                ));
-            }
-        }
-    }
-
-    if let Some(header) = payload.get(..5) {
-        let value = header.iter().fold(0_u64, |accumulator, &byte| {
-            accumulator << 8 | u64::from(byte)
-        });
-        let fields = (0xff_u64 << 19) | (0xff_u64 << 10) | (0xff_u64 << 1);
-        if value & !fields == 0x0000_c804_0001 {
-            let symbols = [
-                ((value >> 19) & 0xff) as u8,
-                ((value >> 10) & 0xff) as u8,
-                ((value >> 1) & 0xff) as u8,
-            ];
-            if symbols.windows(2).all(|pair| pair[0] < pair[1]) {
-                return Ok((
-                    OldHuffmanTable {
-                        entries: vec![
-                            (0b01, 2, symbols[0]),
-                            (0, 1, symbols[1]),
-                            (0b11, 2, symbols[2]),
-                        ],
-                    },
-                    5,
-                ));
-            }
-        }
-    }
-
-    if let Some(header) = payload.get(..7) {
-        let value = header.iter().fold(0_u64, |accumulator, &byte| {
-            accumulator << 8 | u64::from(byte)
-        });
-        let fields = (0xff_u64 << 35) | (0xff_u64 << 26) | (0xff_u64 << 17) | (0xff_u64 << 8);
-        if value & !fields == 0x01_0804_0201_0080 {
-            let symbols = [
-                ((value >> 35) & 0xff) as u8,
-                ((value >> 26) & 0xff) as u8,
-                ((value >> 17) & 0xff) as u8,
-                ((value >> 8) & 0xff) as u8,
-            ];
-            if symbols.windows(2).all(|pair| pair[0] < pair[1]) {
-                return Ok((
-                    OldHuffmanTable {
-                        entries: vec![
-                            (0b00, 2, symbols[0]),
-                            (0b10, 2, symbols[1]),
-                            (0b01, 2, symbols[2]),
-                            (0b11, 2, symbols[3]),
-                        ],
-                    },
-                    7,
-                ));
-            }
-        }
+    if let Some(table) = decode_old_huffman_table(payload) {
+        return Ok(table);
     }
     if let Some(table) = decode_new_huffman_table(payload) {
         return Ok(table);
     }
     Err(KrakenError::UnsupportedQuantum { offset })
+}
+
+fn decode_old_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
+    let mut bits = MsbReader::new(payload);
+    if bits.read(1)? != 0 {
+        return None;
+    }
+    let mut symbols = Vec::new();
+    let mut lengths = Vec::new();
+    if bits.read(1)? == 0 {
+        let symbol_count = bits.read(8)?;
+        if symbol_count == 0 {
+            return None;
+        }
+        if symbol_count == 1 {
+            symbols.push(u8::try_from(bits.read(8)?).ok()?);
+            lengths.push(1);
+        } else {
+            let length_bits = bits.read(3)?;
+            if length_bits > 4 {
+                return None;
+            }
+            for _ in 0..symbol_count {
+                symbols.push(u8::try_from(bits.read(8)?).ok()?);
+                lengths.push(u8::try_from(bits.read(length_bits)?.checked_add(1)?).ok()?);
+            }
+        }
+    } else {
+        let forced_bits = bits.read(2)?;
+        let mut symbol = 0_usize;
+        let mut average_quarters = 32_i32;
+        let mut skip_zero_run = bits.read(1)? != 0;
+        loop {
+            if !skip_zero_run {
+                symbol = symbol.checked_add(bits.read_gamma_run()?)?;
+                if symbol >= 256 {
+                    break;
+                }
+            }
+            skip_zero_run = false;
+            let run = bits.read_gamma_run()?;
+            if symbol.checked_add(run)? > 256 {
+                return None;
+            }
+            for _ in 0..run {
+                let encoded = i32::try_from(bits.read_gamma_x(forced_bits)?).ok()?;
+                let delta = -(encoded & 1) ^ (encoded >> 1);
+                let length = delta.checked_add((average_quarters + 2) >> 2)?;
+                if !(1..=11).contains(&length) {
+                    return None;
+                }
+                symbols.push(u8::try_from(symbol).ok()?);
+                lengths.push(u8::try_from(length).ok()?);
+                average_quarters = length.checked_add((3 * average_quarters + 2) >> 2)?;
+                symbol += 1;
+            }
+            if symbol == 256 {
+                break;
+            }
+        }
+        if symbols.len() < 2 {
+            return None;
+        }
+    }
+    let table = canonical_huffman_table(&symbols, &lengths)?;
+    Some((table, bits.consumed_bytes()))
 }
 
 #[cfg(test)]
@@ -1552,6 +1552,38 @@ impl<'a> MsbReader<'a> {
             }
         }
         Some(value)
+    }
+
+    fn read_gamma_run(&mut self) -> Option<usize> {
+        let zeroes = self.peek_zeroes()?;
+        let width = zeroes.checked_add(1)?.checked_mul(2)?;
+        self.read(width)?.checked_sub(1)
+    }
+
+    fn read_gamma_x(&mut self, forced_bits: usize) -> Option<usize> {
+        let zeroes = self.peek_zeroes()?;
+        let width = zeroes.checked_add(forced_bits)?.checked_add(1)?;
+        let prefix = self.read(width)?;
+        let tier = zeroes
+            .checked_sub(1)?
+            .checked_shl(u32::try_from(forced_bits).ok()?)?;
+        prefix.checked_add(tier)
+    }
+
+    fn peek_zeroes(&self) -> Option<usize> {
+        let total = self.bytes.len().checked_mul(8)?;
+        let mut position = self.position;
+        while position < total {
+            let byte = self.bytes[position / 8];
+            if byte >> (7 - position % 8) & 1 != 0 {
+                return Some(position - self.position);
+            }
+            position += 1;
+            if position - self.position > 23 {
+                return None;
+            }
+        }
+        None
     }
 
     fn read_truncated(&mut self, range: usize) -> Option<usize> {
