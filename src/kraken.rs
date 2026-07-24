@@ -672,6 +672,98 @@ fn history_index(
         })
 }
 
+#[allow(
+    dead_code,
+    reason = "staged paired-bit suffix decoder awaiting distance and length value grammars"
+)]
+struct PairedBits<'a> {
+    bytes: &'a [u8],
+    front_bits: usize,
+    back_bits: usize,
+    stream_offset: usize,
+}
+
+#[allow(
+    dead_code,
+    reason = "staged paired-bit suffix decoder awaiting distance and length value grammars"
+)]
+impl<'a> PairedBits<'a> {
+    const fn new(bytes: &'a [u8], stream_offset: usize) -> Self {
+        Self {
+            bytes,
+            front_bits: 0,
+            back_bits: 0,
+            stream_offset,
+        }
+    }
+
+    fn read_front(&mut self, count: u32) -> Result<u32, KrakenError> {
+        let mut value = 0_u32;
+        for _ in 0..count {
+            value = value << 1 | u32::from(self.front_bit()?);
+        }
+        Ok(value)
+    }
+
+    fn read_back(&mut self, count: u32) -> Result<u32, KrakenError> {
+        let mut value = 0_u32;
+        for _ in 0..count {
+            value = value << 1 | u32::from(self.back_bit()?);
+        }
+        Ok(value)
+    }
+
+    fn read_back_gamma_minus_one(&mut self) -> Result<usize, KrakenError> {
+        let mut leading_zeroes = 0_u32;
+        while self.back_bit()? == 0 {
+            leading_zeroes += 1;
+            if leading_zeroes > 31 {
+                return Err(KrakenError::InvalidQuantum {
+                    offset: self.stream_offset,
+                });
+            }
+        }
+        let tail = self.read_back(leading_zeroes)?;
+        let value = (1_u32 << leading_zeroes) | tail;
+        usize::try_from(value - 1).map_err(|_| KrakenError::InvalidQuantum {
+            offset: self.stream_offset,
+        })
+    }
+
+    fn front_bit(&mut self) -> Result<u8, KrakenError> {
+        self.ensure_available()?;
+        let byte_index = self.front_bits / 8;
+        let bit_index = self.front_bits % 8;
+        self.front_bits += 1;
+        Ok((self.bytes[byte_index] >> (7 - bit_index)) & 1)
+    }
+
+    fn back_bit(&mut self) -> Result<u8, KrakenError> {
+        self.ensure_available()?;
+        let byte_from_end = self.back_bits / 8;
+        let bit_index = self.back_bits % 8;
+        let byte_index = self.bytes.len() - 1 - byte_from_end;
+        self.back_bits += 1;
+        Ok((self.bytes[byte_index] >> (7 - bit_index)) & 1)
+    }
+
+    fn ensure_available(&self) -> Result<(), KrakenError> {
+        let total_bits = self
+            .bytes
+            .len()
+            .checked_mul(8)
+            .ok_or(KrakenError::InvalidQuantum {
+                offset: self.stream_offset,
+            })?;
+        if self.front_bits.saturating_add(self.back_bits) >= total_bits {
+            return Err(KrakenError::InvalidQuantum {
+                offset: self.stream_offset,
+            });
+        }
+        Ok(())
+    }
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -765,7 +857,7 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_SIZE, Cursor, KrakenError, decode, decode_array, decode_quantum, encode,
+        BLOCK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array, decode_quantum, encode,
         execute_lz_commands,
     };
 
@@ -912,6 +1004,21 @@ mod tests {
         assert_eq!(
             execute_lz_commands(&mut output, 12, &[], &[0xc8], &[-9], &[], 1, 42),
             Err(KrakenError::InvalidQuantum { offset: 42 })
+        );
+    }
+
+    #[test]
+    fn decodes_backward_gamma_extended_length_counts() {
+        let mut none = PairedBits::new(&[0x80], 0);
+        assert_eq!(none.read_back_gamma_minus_one(), Ok(0));
+
+        let mut one = PairedBits::new(&[0x40], 0);
+        assert_eq!(one.read_back_gamma_minus_one(), Ok(1));
+
+        let mut truncated = PairedBits::new(&[0], 7);
+        assert_eq!(
+            truncated.read_back_gamma_minus_one(),
+            Err(KrakenError::InvalidQuantum { offset: 7 })
         );
     }
 

@@ -316,16 +316,16 @@ mod tests {
                 random_state.to_le_bytes()[2]
             })
             .collect();
-        let cases = [
-            ("zeros", vec![0; 131_072]),
+        let mut cases = vec![
+            ("zeros".to_owned(), vec![0; 131_072]),
             (
-                "ramp",
+                "ramp".to_owned(),
                 (0..131_072_usize)
                     .map(|index| index.to_le_bytes()[0])
                     .collect(),
             ),
             (
-                "text",
+                "text".to_owned(),
                 b"the quick brown fox jumps over the lazy dog\n"
                     .iter()
                     .copied()
@@ -333,8 +333,17 @@ mod tests {
                     .take(131_072)
                     .collect(),
             ),
-            ("random", random),
+            ("random".to_owned(), random),
         ];
+        for period in [8_usize, 16, 32, 44, 64, 128, 256, 512, 1024] {
+            let seed: Vec<u8> = (0..period)
+                .map(|index| index.wrapping_mul(73).wrapping_add(index / 7).to_le_bytes()[0])
+                .collect();
+            cases.push((
+                format!("period-{period}"),
+                seed.into_iter().cycle().take(131_072).collect(),
+            ));
+        }
         for (name, payload) in cases {
             let encoded = kraken.compress_validated(&payload).unwrap();
             if encoded.starts_with(&[0xcc, 0x06]) {
@@ -369,6 +378,71 @@ mod tests {
                 "{name}: lz={lz_size} literal={:?} bytes={hex}",
                 array_header(arrays)
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room extended-length classifier; requires KRAKEN_DLL"]
+    fn print_oracle_extended_lengths() {
+        fn array_span(input: &[u8]) -> Option<usize> {
+            let first = *input.first()?;
+            let kind = (first >> 4) & 7;
+            if kind == 0 {
+                if first >= 0x80 {
+                    let word = u16::from_be_bytes([*input.first()?, *input.get(1)?]);
+                    return Some(2 + usize::from(word & 0x0fff));
+                }
+                let word = u32::from_be_bytes([0, *input.first()?, *input.get(1)?, *input.get(2)?]);
+                return usize::try_from(word).ok()?.checked_add(3);
+            }
+            let (header, compressed) = if first >= 0x80 {
+                let word = u32::from_be_bytes([0, *input.first()?, *input.get(1)?, *input.get(2)?]);
+                (3_usize, usize::try_from(word & 0x3ff).ok()?)
+            } else {
+                let word = u32::from_be_bytes([
+                    *input.get(1)?,
+                    *input.get(2)?,
+                    *input.get(3)?,
+                    *input.get(4)?,
+                ]);
+                (5_usize, usize::try_from(word & 0x3_ffff).ok()?)
+            };
+            header.checked_add(compressed)
+        }
+
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let seed = [0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00];
+        for size in [
+            64_usize, 128, 255, 256, 257, 280, 281, 282, 300, 320, 384, 512, 640, 768, 1024, 4096,
+            16_384, 65_536, 131_072,
+        ] {
+            let payload: Vec<u8> = seed.iter().copied().cycle().take(size).collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            if encoded.starts_with(&[0xcc, 0x06]) || encoded.get(2..5) == Some(&[7, 0xff, 0xff]) {
+                println!("size={size} non-lz");
+                continue;
+            }
+            let quantum_size = ((usize::from(encoded[2]) << 16
+                | usize::from(encoded[3]) << 8
+                | usize::from(encoded[4]))
+                & 0x3_ffff)
+                + 1;
+            let quantum = &encoded[5..5 + quantum_size];
+            let chunk_size = usize::try_from(
+                u32::from_be_bytes([0, quantum[0], quantum[1], quantum[2]]) & 0x7_ffff,
+            )
+            .unwrap();
+            if chunk_size + 3 > quantum.len() {
+                println!("size={size} entropy-or-other");
+                continue;
+            }
+            let lz = &quantum[3..3 + chunk_size];
+            let mut cursor = 8_usize;
+            for _ in 0..4 {
+                cursor += array_span(&lz[cursor..]).unwrap();
+            }
+            println!("size={size} lz={} suffix={:02x?}", lz.len(), &lz[cursor..]);
         }
     }
 }
