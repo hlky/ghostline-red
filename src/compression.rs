@@ -325,6 +325,12 @@ mod tests {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
         let kraken = Kraken::load(path.as_os_str()).unwrap();
         for &(alphabet, start) in &[
+            (5_u8, 0_u8),
+            (5, 1),
+            (5, 7),
+            (5, 31),
+            (5, 127),
+            (5, 250),
             (8_u8, 0_u8),
             (8, 1),
             (8, 7),
@@ -795,12 +801,16 @@ mod tests {
 
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
         let kraken = Kraken::load(path.as_os_str()).unwrap();
-        for &alphabet in &[8_u8, 16] {
-            let bits = usize::try_from(alphabet.ilog2()).unwrap();
-            let stream_bytes = [43_usize, 42, 43]
-                .into_iter()
-                .map(|symbols| symbols.saturating_mul(bits).div_ceil(8))
-                .sum::<usize>();
+        for &alphabet in &[5_u8, 8, 16] {
+            let stream_bytes = if alphabet == 5 {
+                39
+            } else {
+                let bits = usize::try_from(alphabet.ilog2()).unwrap();
+                [43_usize, 42, 43]
+                    .into_iter()
+                    .map(|symbols| symbols.saturating_mul(bits).div_ceil(8))
+                    .sum::<usize>()
+            };
             for start in 0_u8..=u8::MAX - alphabet {
                 let payload: Vec<u8> = (0..128)
                     .map(|index| start + u8::try_from(index % usize::from(alphabet)).unwrap())

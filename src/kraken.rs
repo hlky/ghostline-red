@@ -772,20 +772,30 @@ fn decode_huffman_table(
             }
         }
     }
-    for &(alphabet_size, max_start) in &[(8_u8, 248_u8), (16, 240)] {
+    for &(alphabet_size, max_start) in &[(5_u8, 250_u8), (8, 248), (16, 240)] {
         for start in 0..=max_start {
             let header = encode_contiguous_new_huffman_header(alphabet_size, start);
             if payload.starts_with(&header) {
-                let bit_length = u8::try_from(alphabet_size.ilog2()).unwrap();
-                let entries = (0..alphabet_size)
-                    .map(|index| {
-                        (
-                            reverse_low_bits(u16::from(index), bit_length),
-                            bit_length,
-                            start + index,
-                        )
-                    })
-                    .collect();
+                let entries = if alphabet_size == 5 {
+                    [(0b00, 2), (0b10, 2), (0b01, 2), (0b011, 3), (0b111, 3)]
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, (code, length))| {
+                            (code, length, start + u8::try_from(index).unwrap())
+                        })
+                        .collect()
+                } else {
+                    let bit_length = u8::try_from(alphabet_size.ilog2()).unwrap();
+                    (0..alphabet_size)
+                        .map(|index| {
+                            (
+                                reverse_low_bits(u16::from(index), bit_length),
+                                bit_length,
+                                start + index,
+                            )
+                        })
+                        .collect()
+                };
                 return Ok((OldHuffmanTable { entries }, header.len()));
             }
         }
@@ -804,16 +814,29 @@ fn reverse_low_bits(mut value: u16, bit_count: u8) -> u16 {
 
 fn encode_contiguous_new_huffman_header(alphabet_size: u8, start: u8) -> Vec<u8> {
     match (alphabet_size, start) {
+        (5, 0) => vec![0xa0, 0x40, 0x4b, 0xeb, 0xa0],
         (8, 0) => vec![0x90, 0x70, 0x08, 0x95, 0xff, 0xe0],
         (16, 0) => vec![0x80, 0xf0, 0x00, 0x82, 0x22, 0xab, 0xfe],
+        (5, _) => {
+            let mut output = vec![0xa0, 0x42, 0x4b];
+            append_new_huffman_start_code(
+                &mut output,
+                start,
+                &[true],
+                &[
+                    true, true, true, false, true, false, true, true, true, false, true,
+                ],
+            );
+            output
+        }
         (8, _) => {
             let mut output = vec![0x90, 0x71, 0x08, 0x95];
-            append_new_huffman_start_code(&mut output, start, 3, 9);
+            append_new_huffman_start_code(&mut output, start, &[true, true, true], &[true; 9]);
             output
         }
         (16, _) => {
             let mut output = vec![0x80, 0xf0, 0x80, 0x82, 0x22, 0xab];
-            append_new_huffman_start_code(&mut output, start, 7, 1);
+            append_new_huffman_start_code(&mut output, start, &[true; 7], &[true]);
             output
         }
         _ => Vec::new(),
@@ -823,17 +846,17 @@ fn encode_contiguous_new_huffman_header(alphabet_size: u8, start: u8) -> Vec<u8>
 fn append_new_huffman_start_code(
     output: &mut Vec<u8>,
     start: u8,
-    leading_ones: usize,
-    delimiter_ones: usize,
+    leading_bits: &[bool],
+    delimiter_bits: &[bool],
 ) {
     debug_assert!(start > 0);
     let tier = usize::try_from((u16::from(start) + 1).ilog2()).unwrap();
     let base = (1_usize << tier) - 1;
     let delta = usize::from(start) - base;
-    let mut bits = Vec::with_capacity(leading_ones + tier + delimiter_ones + tier);
-    bits.extend(std::iter::repeat_n(true, leading_ones));
+    let mut bits = Vec::with_capacity(leading_bits.len() + tier + delimiter_bits.len() + tier);
+    bits.extend_from_slice(leading_bits);
     bits.extend(std::iter::repeat_n(false, tier - 1));
-    bits.extend(std::iter::repeat_n(true, delimiter_ones));
+    bits.extend_from_slice(delimiter_bits);
     for shift in (0..tier).rev() {
         bits.push(delta >> shift & 1 != 0);
     }
@@ -1649,7 +1672,23 @@ mod tests {
     }
 
     #[test]
-    fn decodes_contiguous_new_table_eight_symbol_huffman_array() {
+    fn decodes_contiguous_new_table_five_and_eight_symbol_huffman_arrays() {
+        let five = [
+            0x20, 0x01, 0xfc, 0x00, 0x2e, // type 2: 46 -> 128
+            0xa0, 0x40, 0x4b, 0xeb, 0xa0, // new five-symbol table
+            0x0d, 0x00, // first forward stream is thirteen bytes
+            0xd4, 0xbd, 0x6c, 0xba, 0xfe, 0x94, 0x2b, 0x84, 0xcb, 0xf6, 0xc6, 0x73, 0x08, 0x3b,
+            0x7f, 0x8d, 0x8d, 0x6f, 0xd0, 0xff, 0x69, 0x25, 0xfd, 0x30, 0x1b, 0x0a, 0xae, 0x2f,
+            0x58, 0xc2, 0xf3, 0xbb, 0x0f, 0x7c, 0x7f, 0xcb, 0x43, 0xad, 0xcd,
+        ];
+        let mut expected_five: Vec<u8> = (0..128_usize)
+            .map(|index| u8::try_from(index % 5).unwrap())
+            .collect();
+        deterministic_shuffle(&mut expected_five, 0xa409_3822);
+        let mut cursor = Cursor::new(&five, 0);
+        assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected_five));
+        assert!(cursor.is_empty());
+
         let bytes = [
             0x20, 0x01, 0xfc, 0x00, 0x3a, // type 2: 58 -> 128
             0x90, 0x70, 0x08, 0x95, 0xff, 0xe0, // new eight-symbol table
@@ -1671,6 +1710,10 @@ mod tests {
     #[test]
     fn reproduces_contiguous_new_table_headers() {
         for (alphabet, start, expected) in [
+            (5, 0, "a0404beba0"),
+            (5, 1, "a0424bf5d0"),
+            (5, 7, "a0424b9d7400"),
+            (5, 127, "a0424b81d74000"),
             (8, 0, "90700895ffe0"),
             (8, 1, "90710895fff0"),
             (8, 7, "90710895e7fc00"),
