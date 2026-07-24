@@ -1,0 +1,6 @@
+/target/
+/.tmp/
+*.pdb
+*.exe
+red-schema.json
+
