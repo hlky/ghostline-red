@@ -255,4 +255,120 @@ mod tests {
             println!("{name}: encoded={} tail={tail}", encoded.len());
         }
     }
+
+    #[test]
+    #[ignore = "clean-room entropy classifier; requires KRAKEN_DLL"]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the ignored oracle probe keeps its local parser isolated from production code"
+    )]
+    fn print_oracle_entropy_envelopes() {
+        use std::fmt::Write as _;
+
+        fn array_header(input: &[u8]) -> Option<(u8, usize, usize, usize)> {
+            let first = *input.first()?;
+            let kind = (first >> 4) & 7;
+            if kind == 0 {
+                if first >= 0x80 {
+                    let word = u16::from_be_bytes([*input.first()?, *input.get(1)?]);
+                    return Some((
+                        kind,
+                        2,
+                        usize::from(word & 0x0fff),
+                        usize::from(word & 0x0fff),
+                    ));
+                }
+                let word = u32::from_be_bytes([0, *input.first()?, *input.get(1)?, *input.get(2)?]);
+                return Some((
+                    kind,
+                    3,
+                    usize::try_from(word).ok()?,
+                    usize::try_from(word).ok()?,
+                ));
+            }
+            if first >= 0x80 {
+                let word = u32::from_be_bytes([0, *input.first()?, *input.get(1)?, *input.get(2)?]);
+                let compressed = usize::try_from(word & 0x3ff).ok()?;
+                let decoded = compressed + usize::try_from((word >> 10) & 0x3ff).ok()? + 1;
+                Some((kind, 3, compressed, decoded))
+            } else {
+                let word = u32::from_be_bytes([
+                    *input.get(1)?,
+                    *input.get(2)?,
+                    *input.get(3)?,
+                    *input.get(4)?,
+                ]);
+                let compressed = usize::try_from(word & 0x3_ffff).ok()?;
+                let decoded =
+                    usize::try_from(((word >> 18) | (u32::from(first) << 14)) & 0x3_ffff).ok()? + 1;
+                Some((kind, 5, compressed, decoded))
+            }
+        }
+
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let mut random_state = 0x9e37_79b9_7f4a_7c15_u64;
+        let random: Vec<u8> = (0..131_072)
+            .map(|_| {
+                random_state ^= random_state << 13;
+                random_state ^= random_state >> 7;
+                random_state ^= random_state << 17;
+                random_state.to_le_bytes()[2]
+            })
+            .collect();
+        let cases = [
+            ("zeros", vec![0; 131_072]),
+            (
+                "ramp",
+                (0..131_072_usize)
+                    .map(|index| index.to_le_bytes()[0])
+                    .collect(),
+            ),
+            (
+                "text",
+                b"the quick brown fox jumps over the lazy dog\n"
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(131_072)
+                    .collect(),
+            ),
+            ("random", random),
+        ];
+        for (name, payload) in cases {
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            if encoded.starts_with(&[0xcc, 0x06]) {
+                println!("{name}: outer raw");
+                continue;
+            }
+            if encoded.get(2..5) == Some(&[0x07, 0xff, 0xff]) {
+                println!("{name}: memset");
+                continue;
+            }
+            let quantum_size = usize::from(encoded[2]) << 16
+                | usize::from(encoded[3]) << 8
+                | usize::from(encoded[4]);
+            let quantum = &encoded[5..=5 + quantum_size];
+            let chunk_header = u32::from_be_bytes([0, quantum[0], quantum[1], quantum[2]]);
+            if chunk_header & 0x80_0000 == 0 {
+                println!("{name}: entropy {:?}", array_header(quantum));
+                continue;
+            }
+            let lz_size = usize::try_from(chunk_header & 0x7_ffff).unwrap();
+            let lz = &quantum[3..3 + lz_size];
+            let arrays = if payload.len() == 131_072 {
+                &lz[8..]
+            } else {
+                lz
+            };
+            let mut hex = String::new();
+            for byte in lz {
+                write!(&mut hex, "{byte:02x}").unwrap();
+            }
+            println!(
+                "{name}: lz={lz_size} literal={:?} bytes={hex}",
+                array_header(arrays)
+            );
+        }
+    }
 }

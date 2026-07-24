@@ -449,6 +449,229 @@ fn decode_recursive_arrays(
     Ok(output)
 }
 
+#[allow(
+    dead_code,
+    reason = "wired into quantum decoding once the paired-bit distance parser is implemented"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the side streams are explicit to make exact consumption auditable"
+)]
+fn execute_lz_commands(
+    output: &mut Vec<u8>,
+    chunk_end: usize,
+    literals: &[u8],
+    commands: &[u8],
+    explicit_offsets: &[i32],
+    long_lengths: &[usize],
+    mode: u32,
+    stream_offset: usize,
+) -> Result<(), KrakenError> {
+    if mode > 1 || chunk_end < output.len() {
+        return Err(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        });
+    }
+    let output_start = 0_usize;
+    let mut literal_cursor = 0_usize;
+    let mut offset_cursor = 0_usize;
+    let mut length_cursor = 0_usize;
+    let mut recent = [-8_i32; 3];
+    let mut last_offset = -8_i32;
+
+    for &command in commands {
+        let literal_code = usize::from(command & 3);
+        let literal_length = if literal_code < 3 {
+            literal_code
+        } else {
+            take_length(long_lengths, &mut length_cursor, stream_offset)?
+        };
+        emit_literals(
+            output,
+            chunk_end,
+            literals,
+            &mut literal_cursor,
+            literal_length,
+            last_offset,
+            mode,
+            output_start,
+            stream_offset,
+        )?;
+
+        let offset_index = usize::from(command >> 6);
+        let selected_offset = if offset_index < 3 {
+            recent[offset_index]
+        } else {
+            let value =
+                *explicit_offsets
+                    .get(offset_cursor)
+                    .ok_or(KrakenError::InvalidQuantum {
+                        offset: stream_offset,
+                    })?;
+            offset_cursor += 1;
+            value
+        };
+        match offset_index {
+            0 => {}
+            1 => recent.swap(0, 1),
+            2 => {
+                recent = [recent[2], recent[0], recent[1]];
+            }
+            3 => {
+                recent = [selected_offset, recent[0], recent[1]];
+            }
+            _ => {
+                return Err(KrakenError::InvalidQuantum {
+                    offset: stream_offset,
+                });
+            }
+        }
+        last_offset = selected_offset;
+
+        let match_code = usize::from((command >> 2) & 0xf);
+        let match_length = if match_code < 15 {
+            match_code + 2
+        } else {
+            take_length(long_lengths, &mut length_cursor, stream_offset)?
+                .checked_add(14)
+                .ok_or(KrakenError::InvalidQuantum {
+                    offset: stream_offset,
+                })?
+        };
+        copy_match(
+            output,
+            chunk_end,
+            selected_offset,
+            match_length,
+            output_start,
+            stream_offset,
+        )?;
+    }
+
+    let final_literal_count = literals.len().saturating_sub(literal_cursor);
+    emit_literals(
+        output,
+        chunk_end,
+        literals,
+        &mut literal_cursor,
+        final_literal_count,
+        last_offset,
+        mode,
+        output_start,
+        stream_offset,
+    )?;
+    if output.len() != chunk_end
+        || literal_cursor != literals.len()
+        || offset_cursor != explicit_offsets.len()
+        || length_cursor != long_lengths.len()
+    {
+        return Err(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        });
+    }
+    Ok(())
+}
+
+#[allow(dead_code, reason = "used by the staged LZ command executor")]
+fn take_length(lengths: &[usize], cursor: &mut usize, offset: usize) -> Result<usize, KrakenError> {
+    let value = lengths
+        .get(*cursor)
+        .copied()
+        .ok_or(KrakenError::InvalidQuantum { offset })?;
+    *cursor += 1;
+    Ok(value)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "explicit cursors keep LZ side-stream consumption auditable"
+)]
+#[allow(dead_code, reason = "used by the staged LZ command executor")]
+fn emit_literals(
+    output: &mut Vec<u8>,
+    chunk_end: usize,
+    literals: &[u8],
+    literal_cursor: &mut usize,
+    count: usize,
+    last_offset: i32,
+    mode: u32,
+    output_start: usize,
+    stream_offset: usize,
+) -> Result<(), KrakenError> {
+    let literal_end = literal_cursor
+        .checked_add(count)
+        .ok_or(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        })?;
+    let source = literals
+        .get(*literal_cursor..literal_end)
+        .ok_or(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        })?;
+    if output.len().saturating_add(count) > chunk_end {
+        return Err(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        });
+    }
+    for &literal in source {
+        let value = if mode == 0 {
+            let predictor = history_index(output.len(), last_offset, output_start, stream_offset)?;
+            literal.wrapping_add(output[predictor])
+        } else {
+            literal
+        };
+        output.push(value);
+    }
+    *literal_cursor = literal_end;
+    Ok(())
+}
+
+#[allow(dead_code, reason = "used by the staged LZ command executor")]
+fn copy_match(
+    output: &mut Vec<u8>,
+    chunk_end: usize,
+    offset: i32,
+    count: usize,
+    output_start: usize,
+    stream_offset: usize,
+) -> Result<(), KrakenError> {
+    if output.len().saturating_add(count) > chunk_end {
+        return Err(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        });
+    }
+    for _ in 0..count {
+        let source = history_index(output.len(), offset, output_start, stream_offset)?;
+        let value = output[source];
+        output.push(value);
+    }
+    Ok(())
+}
+
+#[allow(dead_code, reason = "used by the staged LZ command executor")]
+fn history_index(
+    output_position: usize,
+    offset: i32,
+    output_start: usize,
+    stream_offset: usize,
+) -> Result<usize, KrakenError> {
+    if offset >= 0 {
+        return Err(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        });
+    }
+    let distance =
+        usize::try_from(offset.unsigned_abs()).map_err(|_| KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        })?;
+    output_position
+        .checked_sub(distance)
+        .filter(|source| *source >= output_start)
+        .ok_or(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        })
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -541,7 +764,10 @@ impl<'a> Cursor<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_SIZE, Cursor, KrakenError, decode, decode_array, decode_quantum, encode};
+    use super::{
+        BLOCK_SIZE, Cursor, KrakenError, decode, decode_array, decode_quantum, encode,
+        execute_lz_commands,
+    };
 
     #[test]
     fn round_trips_raw_and_constant_blocks() {
@@ -658,6 +884,35 @@ mod tests {
         let mut output = Vec::new();
         assert_eq!(decode_quantum(&payload, 4, &mut output, 0), Ok(()));
         assert_eq!(output, [9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn executes_mode_one_lz_commands() {
+        let mut output = b"abcdefgh".to_vec();
+        assert_eq!(
+            execute_lz_commands(&mut output, 14, b"XY", &[0x0a], &[], &[], 1, 0),
+            Ok(())
+        );
+        assert_eq!(output, b"abcdefghXYcdef");
+    }
+
+    #[test]
+    fn executes_mode_zero_delta_literals() {
+        let mut output = b"abcdefgh".to_vec();
+        assert_eq!(
+            execute_lz_commands(&mut output, 14, &[1, 1], &[0x0a], &[], &[], 0, 0),
+            Ok(())
+        );
+        assert_eq!(output, b"abcdefghbccdef");
+    }
+
+    #[test]
+    fn rejects_lz_matches_before_output_history() {
+        let mut output = b"abcdefgh".to_vec();
+        assert_eq!(
+            execute_lz_commands(&mut output, 12, &[], &[0xc8], &[-9], &[], 1, 42),
+            Err(KrakenError::InvalidQuantum { offset: 42 })
+        );
     }
 
     #[test]
