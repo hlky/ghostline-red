@@ -508,48 +508,58 @@ fn encode_huffman_block(block: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn encode_huffman_array(input: &[u8]) -> Option<Vec<u8>> {
-    let (&minimum, &maximum) = (input.iter().min()?, input.iter().max()?);
-    let mut present = [false; 256];
+    let mut frequencies = [0_usize; 256];
     for &byte in input {
-        present[usize::from(byte)] = true;
+        frequencies[usize::from(byte)] = frequencies[usize::from(byte)].checked_add(1)?;
     }
-    let symbols: Vec<u8> = present
+    let symbols: Vec<u8> = frequencies
         .into_iter()
         .enumerate()
-        .filter(|&(_, is_present)| is_present)
+        .filter(|&(_, frequency)| frequency != 0)
         .map(|(symbol, _)| u8::try_from(symbol).expect("symbol index fits in a byte"))
         .collect();
     if symbols.len() == 1 {
         return encode_array_envelope(3, &[symbols[0]], input.len());
     }
+    let lengths = huffman_code_lengths(&symbols, &frequencies)?;
+    let canonical = canonical_huffman_table(&symbols, &lengths)?;
+    let mut codes = [None; 256];
+    for &(code, bit_count, symbol) in &canonical.entries {
+        codes[usize::from(symbol)] = Some((code, bit_count));
+    }
+    let mut table = encode_sparse_huffman_table(&symbols, &lengths)?;
+    let encoded_cost = huffman_payload_cost(input, &codes)?.checked_add(table.len())?;
+
+    let minimum = *symbols.first()?;
+    let maximum = *symbols.last()?;
     let span = usize::from(maximum) - usize::from(minimum) + 1;
-    let (alphabet_size, start, table) = if (2..=4).contains(&symbols.len()) {
-        let alphabet_size = u8::try_from(symbols.len()).ok()?;
-        (alphabet_size, 0, encode_old_huffman_table(&symbols)?)
-    } else {
-        let alphabet_size = [5_u8, 8, 16, 32, 64, 128]
-            .into_iter()
-            .find(|&size| span <= usize::from(size))?;
+    if let Some(alphabet_size) = [5_u8, 8, 16, 32, 64, 128]
+        .into_iter()
+        .find(|&size| span <= usize::from(size))
+    {
         let start = minimum.min(u8::MAX - alphabet_size + 1);
-        if usize::from(maximum) >= usize::from(start) + usize::from(alphabet_size) {
-            return None;
+        if usize::from(maximum) < usize::from(start) + usize::from(alphabet_size) {
+            let compact_table = encode_contiguous_new_huffman_header(alphabet_size, start);
+            let mut compact_codes = [None; 256];
+            for symbol_index in 0..alphabet_size {
+                compact_codes[usize::from(start + symbol_index)] =
+                    huffman_encoder_code(alphabet_size, symbol_index);
+            }
+            if !compact_table.is_empty() {
+                let compact_cost = huffman_payload_cost(input, &compact_codes)?
+                    .checked_add(compact_table.len())?;
+                if compact_cost < encoded_cost {
+                    table = compact_table;
+                    codes = compact_codes;
+                }
+            }
         }
-        let table = encode_contiguous_new_huffman_header(alphabet_size, start);
-        if table.is_empty() {
-            return None;
-        }
-        (alphabet_size, start, table)
-    };
+    }
     let mut first_bits = LsbWriter::with_capacity(input.len().div_ceil(3));
     let mut second_bits = LsbWriter::with_capacity(input.len() / 3);
     let mut backward_bits = LsbWriter::with_capacity(input.len().saturating_add(1) / 3);
     for (index, &symbol) in input.iter().enumerate() {
-        let symbol_index = if alphabet_size <= 4 {
-            u8::try_from(symbols.binary_search(&symbol).ok()?).ok()?
-        } else {
-            symbol - start
-        };
-        let (code, bit_count) = huffman_encoder_code(alphabet_size, symbol_index)?;
+        let (code, bit_count) = codes[usize::from(symbol)]?;
         match index % 3 {
             0 => first_bits.push(code, bit_count),
             1 => backward_bits.push(code, bit_count),
@@ -573,15 +583,19 @@ fn encode_huffman_array(input: &[u8]) -> Option<Vec<u8>> {
     encode_array_envelope(2, &payload, input.len())
 }
 
+fn huffman_payload_cost(input: &[u8], codes: &[Option<(u16, u8)>; 256]) -> Option<usize> {
+    let mut partition_bits = [0_usize; 3];
+    for (index, &symbol) in input.iter().enumerate() {
+        partition_bits[index % 3] =
+            partition_bits[index % 3].checked_add(usize::from(codes[usize::from(symbol)]?.1))?;
+    }
+    partition_bits
+        .into_iter()
+        .try_fold(2_usize, |total, bits| total.checked_add(bits.div_ceil(8)))
+}
+
 fn huffman_encoder_code(alphabet_size: u8, symbol_index: u8) -> Option<(u16, u8)> {
     match alphabet_size {
-        2 => [(0, 1), (1, 1)].get(usize::from(symbol_index)).copied(),
-        3 => [(0b01, 2), (0, 1), (0b11, 2)]
-            .get(usize::from(symbol_index))
-            .copied(),
-        4 => [(0b00, 2), (0b10, 2), (0b01, 2), (0b11, 2)]
-            .get(usize::from(symbol_index))
-            .copied(),
         5 => [(0b00, 2), (0b10, 2), (0b01, 2), (0b011, 3), (0b111, 3)]
             .get(usize::from(symbol_index))
             .copied(),
@@ -593,29 +607,85 @@ fn huffman_encoder_code(alphabet_size: u8, symbol_index: u8) -> Option<(u16, u8)
     }
 }
 
-fn encode_old_huffman_table(symbols: &[u8]) -> Option<Vec<u8>> {
-    match symbols {
-        [first, last] => {
-            let value = 0x0080_0000 | u32::from(*first) << 11 | u32::from(*last) << 3;
-            Some(value.to_be_bytes().to_vec())
-        }
-        [first, middle, last] => {
-            let value = 0x0000_c804_0001_u64
-                | u64::from(*first) << 19
-                | u64::from(*middle) << 10
-                | u64::from(*last) << 1;
-            Some(value.to_be_bytes()[3..].to_vec())
-        }
-        [first, second, third, last] => {
-            let value = 0x01_0804_0201_0080_u64
-                | u64::from(*first) << 35
-                | u64::from(*second) << 26
-                | u64::from(*third) << 17
-                | u64::from(*last) << 8;
-            Some(value.to_be_bytes()[1..].to_vec())
-        }
-        _ => None,
+fn huffman_code_lengths(symbols: &[u8], frequencies: &[usize; 256]) -> Option<Vec<u8>> {
+    if !(2..=255).contains(&symbols.len()) {
+        return None;
     }
+    let leaf_count = symbols.len();
+    let mut weights: Vec<usize> = symbols
+        .iter()
+        .map(|&symbol| frequencies[usize::from(symbol)])
+        .collect();
+    let mut parents = vec![usize::MAX; leaf_count * 2 - 1];
+    let mut active: Vec<usize> = (0..leaf_count).collect();
+    while active.len() > 1 {
+        active.sort_unstable_by_key(|&node| (weights[node], node));
+        let first = active.remove(0);
+        let second = active.remove(0);
+        let parent = weights.len();
+        weights.push(weights[first].checked_add(weights[second])?);
+        parents[first] = parent;
+        parents[second] = parent;
+        active.push(parent);
+    }
+    let mut lengths = Vec::with_capacity(leaf_count);
+    for leaf in 0..leaf_count {
+        let mut length = 0_u8;
+        let mut node = leaf;
+        while parents[node] != usize::MAX {
+            length = length.checked_add(1)?;
+            node = parents[node];
+        }
+        lengths.push(length);
+    }
+    if lengths.iter().all(|&length| length <= 11) {
+        return Some(lengths);
+    }
+
+    // A complete, length-limited tree is a safe fallback for extremely skewed
+    // distributions. Give the shorter leaves to the most frequent symbols.
+    let long_length = u8::try_from(leaf_count.next_power_of_two().ilog2()).ok()?;
+    let short_count = (1_usize << long_length).checked_sub(leaf_count)?;
+    let mut ranked: Vec<usize> = (0..leaf_count).collect();
+    ranked.sort_unstable_by_key(|&index| {
+        (
+            std::cmp::Reverse(frequencies[usize::from(symbols[index])]),
+            symbols[index],
+        )
+    });
+    lengths.fill(long_length);
+    for &index in ranked.iter().take(short_count) {
+        lengths[index] = long_length.checked_sub(1)?;
+    }
+    Some(lengths)
+}
+
+fn encode_sparse_huffman_table(symbols: &[u8], lengths: &[u8]) -> Option<Vec<u8>> {
+    if symbols.len() != lengths.len() || !(2..=255).contains(&symbols.len()) {
+        return None;
+    }
+    let maximum = lengths.iter().copied().max()?;
+    if !(1..=11).contains(&maximum) {
+        return None;
+    }
+    let length_bits = if maximum == 1 {
+        0
+    } else {
+        u32::from(maximum - 1).ilog2() + 1
+    };
+    if length_bits > 4 {
+        return None;
+    }
+    let mut bits = MsbBits::new();
+    bits.push_bit(false);
+    bits.push_bit(false);
+    bits.push_value(u32::try_from(symbols.len()).ok()?, 8);
+    bits.push_value(length_bits, 3);
+    for (&symbol, &length) in symbols.iter().zip(lengths) {
+        bits.push_value(u32::from(symbol), 8);
+        bits.push_value(u32::from(length - 1), length_bits);
+    }
+    Some(bits.finish())
 }
 
 fn encode_array_envelope(array_type: u8, payload: &[u8], decoded_size: usize) -> Option<Vec<u8>> {
@@ -3015,6 +3085,42 @@ mod tests {
             assert!(encoded.len() < payload.len());
             assert_eq!(decode(&encoded, payload.len()), Ok(payload));
         }
+    }
+
+    #[test]
+    fn general_sparse_alphabets_use_frequency_huffman_tables() {
+        for symbols in [
+            &[0_u8, 17, 63, 129, 200, 255][..],
+            &[1_u8, 9, 31, 65, 127, 191, 223, 254],
+            &[
+                0_u8, 3, 7, 12, 18, 25, 33, 42, 52, 63, 75, 88, 102, 117, 133, 150, 168, 187, 207,
+                228, 250,
+            ],
+        ] {
+            let mut payload = Vec::with_capacity(CHUNK_SIZE);
+            for index in 0..CHUNK_SIZE {
+                let rank = index.trailing_zeros() as usize % symbols.len();
+                payload.push(symbols[rank]);
+            }
+            let encoded = encode(&payload);
+            assert!(encoded.len() < payload.len());
+            assert_eq!(decode(&encoded, payload.len()), Ok(payload));
+        }
+    }
+
+    #[test]
+    fn length_limited_huffman_fallback_is_complete() {
+        let symbols: Vec<u8> = (0..64).collect();
+        let mut frequencies = [0_usize; 256];
+        let mut first = 1_usize;
+        let mut second = 1_usize;
+        for &symbol in &symbols {
+            frequencies[usize::from(symbol)] = first;
+            (first, second) = (second, first.saturating_add(second));
+        }
+        let lengths = super::huffman_code_lengths(&symbols, &frequencies).unwrap();
+        assert!(lengths.iter().all(|&length| length <= 11));
+        assert!(super::canonical_huffman_table(&symbols, &lengths).is_some());
     }
 
     #[test]
