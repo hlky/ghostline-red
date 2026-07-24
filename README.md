@@ -71,6 +71,9 @@ Encode a compatible stream without a DLL:
 & $red kraken-encode '.\input.bin' '.\input.kraken'
 ```
 
+Add `--native` to use the selected library in the crash-isolated worker when
+collecting differential compression vectors.
+
 Decode a stream composed of currently supported block, entropy-array, and
 chunk forms:
 

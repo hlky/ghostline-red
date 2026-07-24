@@ -25,7 +25,13 @@ enum Command {
     #[command(hide = true)]
     KrakenDecompressWorker,
     /// Encode a DLL-free Kraken stream (raw blocks, with constant-block compression).
-    KrakenEncode { input: PathBuf, output: PathBuf },
+    KrakenEncode {
+        input: PathBuf,
+        output: PathBuf,
+        /// Prefer the crash-isolated native compressor for differential diagnosis.
+        #[arg(long)]
+        native: bool,
+    },
     /// Decode a DLL-free Kraken stream supported by the clean-room backend.
     KrakenDecode {
         input: PathBuf,
@@ -127,10 +133,18 @@ fn main() -> Result<()> {
             let output = archive::decompress_worker(&input, cli.kraken.as_os_str())?;
             std::io::stdout().write_all(&output)?;
         }
-        Command::KrakenEncode { input, output } => {
+        Command::KrakenEncode {
+            input,
+            output,
+            native,
+        } => {
             let decoded =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
-            let encoded = kraken::encode(&decoded);
+            let encoded = if native {
+                archive::compress_payload_isolated(&decoded, cli.kraken.as_os_str())
+            } else {
+                kraken::encode(&decoded)
+            };
             fs::write(&output, encoded)
                 .with_context(|| format!("failed to write {}", output.display()))?;
         }

@@ -769,6 +769,21 @@ fn compress_batch_isolated(inputs: &[Vec<u8>], kraken_path: &OsStr) -> Vec<Optio
     parse_compression_batch(&output.stdout, inputs.len()).unwrap_or_else(fallback)
 }
 
+/// Compresses one payload through the crash-isolated native worker, falling
+/// back to the clean-room encoder if the worker is unavailable or does not
+/// produce a smaller representation.
+///
+/// This function is infallible by design; worker failures select the safe
+/// clean-room representation.
+#[must_use]
+pub fn compress_payload_isolated(input: &[u8], kraken_path: &OsStr) -> Vec<u8> {
+    compress_batch_isolated(&[input.to_vec()], kraken_path)
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or_else(|| kraken::encode(input))
+}
+
 fn parse_compression_batch(bytes: &[u8], expected: usize) -> Option<Vec<Option<Vec<u8>>>> {
     let mut cursor = 0_usize;
     let count = usize::try_from(read_wire_u32(bytes, &mut cursor).ok()?).ok()?;
