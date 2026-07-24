@@ -166,6 +166,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "clean-room stored-quantum probe; requires KRAKEN_DLL"]
+    fn verify_candidate_stored_quantum() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let payload: Vec<u8> = (0..65_536_usize)
+            .map(|index| index.wrapping_mul(73).to_le_bytes()[0])
+            .collect();
+        for block_header in [[0x8c, 0x06], [0x0c, 0x06]] {
+            let mut framed = Vec::with_capacity(payload.len() + 5);
+            framed.extend_from_slice(&block_header);
+            framed.extend_from_slice(&[0x00, 0xff, 0xff]);
+            framed.extend_from_slice(&payload);
+            assert_eq!(
+                kraken.decompress(&framed, payload.len()).unwrap(),
+                payload,
+                "stored quantum with block header {block_header:02x?}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "clean-room compatibility test; requires KRAKEN_DLL"]
     fn native_decoder_accepts_clean_room_encoder() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
@@ -186,6 +207,41 @@ mod tests {
         ] {
             let encoded = crate::kraken::encode(&payload);
             assert_eq!(kraken.decompress(&encoded, payload.len()).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room whole-match probe; requires KRAKEN_DLL"]
+    fn print_oracle_whole_match_quantums() {
+        use std::fmt::Write as _;
+
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let mut state = 0x243f_6a88_85a3_08d3_u64;
+        let block: Vec<u8> = (0..262_144)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state.to_le_bytes()[3]
+            })
+            .collect();
+        let mut changed = block.clone();
+        changed[17] ^= 1;
+        for (name, payload) in [
+            ("repeat2", [block.as_slice(), block.as_slice()].concat()),
+            (
+                "repeat3",
+                [block.as_slice(), block.as_slice(), block.as_slice()].concat(),
+            ),
+            ("changed", [block.as_slice(), changed.as_slice()].concat()),
+        ] {
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            let mut tail = String::new();
+            for byte in encoded.iter().skip(262_130) {
+                write!(&mut tail, "{byte:02x}").unwrap();
+            }
+            println!("{name}: encoded={} tail={tail}", encoded.len());
         }
     }
 }

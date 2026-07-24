@@ -2,8 +2,8 @@
 //!
 //! Streams are divided into independent 256 KiB blocks. This module emits
 //! standards-compatible raw blocks and compact constant-byte blocks. The
-//! decoder accepts those same block forms and rejects compressed entropy
-//! quanta until their bounded decoder is implemented.
+//! decoder accepts those block forms plus stored compressed-block quantums and
+//! rejects entropy-coded quantums until their bounded decoder is implemented.
 
 use thiserror::Error;
 
@@ -55,7 +55,7 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
     output
 }
 
-/// Decodes raw and constant-byte Kraken blocks.
+/// Decodes raw blocks, constant-byte blocks, and stored quantums.
 ///
 /// `decoded_size` is authoritative because raw Kraken block headers do not
 /// carry their uncompressed length.
@@ -75,7 +75,12 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
                 offset: input_offset,
             })?;
         input_offset += 2;
-        if header == RAW_BLOCK_HEADER {
+        if header[1] != 0x06 {
+            return Err(KrakenError::InvalidHeader {
+                offset: input_offset - 2,
+            });
+        }
+        if matches!(header[0], 0x4c | 0xcc) {
             let end = input_offset
                 .checked_add(block_size)
                 .ok_or(KrakenError::Truncated {
@@ -89,7 +94,7 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
             input_offset = end;
             continue;
         }
-        if header != COMPRESSED_BLOCK_HEADER {
+        if !matches!(header[0], 0x0c | 0x8c) {
             return Err(KrakenError::InvalidHeader {
                 offset: input_offset - 2,
             });
@@ -100,6 +105,28 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
                 offset: input_offset,
             })?;
         if quantum != MEMSET_QUANTUM {
+            let quantum_header =
+                u32::from(quantum[0]) << 16 | u32::from(quantum[1]) << 8 | u32::from(quantum[2]);
+            let stored_size = usize::try_from((quantum_header & 0x3_ffff) + 1).map_err(|_| {
+                KrakenError::UnsupportedQuantum {
+                    offset: input_offset,
+                }
+            })?;
+            if quantum_header <= 0x3_ffff && stored_size == block_size {
+                input_offset += 3;
+                let end = input_offset
+                    .checked_add(stored_size)
+                    .ok_or(KrakenError::Truncated {
+                        offset: input_offset,
+                    })?;
+                output.extend_from_slice(input.get(input_offset..end).ok_or(
+                    KrakenError::Truncated {
+                        offset: input_offset,
+                    },
+                )?);
+                input_offset = end;
+                continue;
+            }
             return Err(KrakenError::UnsupportedQuantum {
                 offset: input_offset,
             });
@@ -153,13 +180,28 @@ mod tests {
     }
 
     #[test]
+    fn decodes_stored_quantums_and_non_restart_headers() {
+        let payload: Vec<u8> = (0..65_536_usize)
+            .map(|index| index.wrapping_mul(73).to_le_bytes()[0])
+            .collect();
+        let mut stored = vec![0x0c, 0x06, 0x00, 0xff, 0xff];
+        stored.extend_from_slice(&payload);
+        assert_eq!(decode(&stored, payload.len()), Ok(payload));
+
+        assert_eq!(
+            decode(&[0x0c, 0x06, 0x07, 0xff, 0xff, 0x5a], 16),
+            Ok(vec![0x5a; 16])
+        );
+    }
+
+    #[test]
     fn rejects_truncated_and_unknown_streams() {
         assert_eq!(
             decode(&[0xcc, 0x06, 1], 2),
             Err(KrakenError::Truncated { offset: 2 })
         );
         assert_eq!(
-            decode(&[0x8c, 0x06, 0, 0, 0], 1),
+            decode(&[0x8c, 0x06, 4, 0, 0], 1),
             Err(KrakenError::UnsupportedQuantum { offset: 2 })
         );
         assert_eq!(
