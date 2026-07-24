@@ -1543,3 +1543,71 @@ fn json_string_u64(value: &Value) -> Result<u64, WriterError> {
 fn unsupported(message: impl Into<String>) -> WriterError {
     WriterError::Unsupported(message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::write_with_template;
+    use crate::{codec, schema};
+    use std::{
+        collections::{BTreeSet, HashMap},
+        env,
+        ffi::OsStr,
+        fs,
+        path::PathBuf,
+    };
+
+    #[test]
+    #[ignore = "real CR2W round-trip test; requires CR2W_FIXTURE and RED_SCHEMA"]
+    fn serialized_cr2w_fixture_round_trips_and_applies_edits() {
+        let fixture = env::var_os("CR2W_FIXTURE").map(PathBuf::from).unwrap();
+        let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
+        let classes: HashMap<String, schema::RedClass> =
+            serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
+        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let missing_dll = OsStr::new("missing-kraken.dll");
+        let mut document = codec::decode_wkit(&fixture, &class_names, missing_dll).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let json_path = workspace.path().join("fixture.json");
+        let output_path = workspace.path().join("roundtrip.cr2w");
+        fs::write(&json_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+
+        write_with_template(
+            &json_path,
+            &fixture,
+            &output_path,
+            &class_names,
+            missing_dll,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&output_path).unwrap(), fs::read(&fixture).unwrap());
+
+        let replacement = document
+            .pointer("/Data/RootChunk/autoFoliageMapping/DepotPath/$value")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_owned();
+        let target = document
+            .pointer_mut("/Data/RootChunk/areaResource/DepotPath/$value")
+            .unwrap();
+        *target = serde_json::Value::String(replacement.clone());
+        fs::write(&json_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
+        write_with_template(
+            &json_path,
+            &fixture,
+            &output_path,
+            &class_names,
+            missing_dll,
+        )
+        .unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+
+        assert_ne!(fs::read(&output_path).unwrap(), fs::read(&fixture).unwrap());
+        assert_eq!(
+            decoded
+                .pointer("/Data/RootChunk/areaResource/DepotPath/$value")
+                .and_then(serde_json::Value::as_str),
+            Some(replacement.as_str())
+        );
+    }
+}
