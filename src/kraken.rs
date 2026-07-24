@@ -1410,15 +1410,13 @@ fn decode_huffman_table(
             }
         }
     }
-    if let Some(table) = decode_known_new_huffman_table(payload) {
-        return Ok(table);
-    }
-    if let Some(table) = decode_contiguous_new_huffman_table(payload) {
+    if let Some(table) = decode_new_huffman_table(payload) {
         return Ok(table);
     }
     Err(KrakenError::UnsupportedQuantum { offset })
 }
 
+#[cfg(test)]
 const STREAMINGWORLD_LITERAL_HEADER: &[u8] = &[
     0x8c, 0xdd, 0x80, 0x0b, 0x24, 0xcf, 0xf3, 0xf9, 0x42, 0x4a, 0x49, 0x49, 0x17, 0x35, 0x4e, 0x3e,
     0x4b, 0x29, 0x4c, 0x6c, 0xd0, 0x94, 0xb0, 0xa2, 0x59, 0xe6, 0x91, 0x24, 0x10, 0x82, 0xb1, 0xe2,
@@ -1427,17 +1425,7 @@ const STREAMINGWORLD_LITERAL_HEADER: &[u8] = &[
     0x6d, 0xfe, 0xfd, 0xbd, 0x4f, 0x3d, 0xb6, 0xcd, 0xe6, 0xfc, 0xdb, 0x3f, 0xd9, 0xd4, 0x7e, 0x02,
     0x07, 0x21, 0x11, 0xa0, 0x09, 0x00, 0x80, 0x18,
 ];
-const STREAMINGWORLD_LITERAL_CODE_LENGTHS: [u8; 256] = [
-    3, 6, 7, 8, 8, 8, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 8, 8, 9, 7, 10, 9, 10, 8, 10, 10,
-    10, 8, 10, 10, 8, 8, 9, 9, 10, 9, 8, 8, 8, 9, 9, 9, 7, 8, 8, 8, 8, 9, 9, 0, 8, 8, 0, 9, 8, 9,
-    0, 0, 8, 9, 9, 7, 8, 7, 8, 9, 8, 7, 10, 9, 8, 9, 8, 8, 10, 8, 7, 9, 7, 8, 9, 8, 8, 8, 9, 9, 8,
-    9, 7, 9, 9, 6, 10, 5, 7, 6, 7, 5, 7, 7, 7, 5, 8, 8, 6, 7, 5, 5, 6, 9, 5, 6, 5, 7, 7, 8, 8, 7,
-    8, 9, 0, 10, 10, 0, 9, 10, 0, 9, 10, 0, 0, 9, 0, 10, 0, 8, 0, 8, 10, 0, 10, 0, 10, 0, 0, 9, 10,
-    10, 0, 0, 9, 10, 0, 10, 0, 0, 8, 10, 0, 0, 0, 9, 10, 9, 10, 10, 0, 9, 0, 9, 9, 9, 10, 10, 0, 9,
-    0, 10, 10, 0, 0, 10, 10, 10, 0, 10, 9, 9, 0, 9, 10, 0, 9, 10, 9, 8, 0, 9, 8, 0, 8, 0, 8, 9, 10,
-    8, 9, 8, 0, 9, 10, 10, 0, 10, 0, 9, 0, 9, 9, 10, 10, 0, 8, 9, 0, 9, 9, 8, 0, 8, 10, 10, 8, 0,
-    10, 0, 10, 0, 8, 0, 10, 10, 0, 9, 8, 10, 9, 9, 0, 0, 9, 9,
-];
+#[cfg(test)]
 const MAINMENU_RLE_COMMAND_HEADER: &[u8] = &[
     0x97, 0x46, 0xc0, 0x8b, 0x92, 0x88, 0x86, 0x74, 0x4c, 0xb5, 0x95, 0x2f, 0x96, 0xe2, 0x6d, 0x5a,
     0x12, 0xd7, 0xab, 0x91, 0x4a, 0xa5, 0x5a, 0xba, 0x89, 0xa6, 0x7a, 0xeb, 0x7d, 0xeb, 0x4f, 0x18,
@@ -1445,94 +1433,144 @@ const MAINMENU_RLE_COMMAND_HEADER: &[u8] = &[
     0xaf, 0x82, 0x0c, 0x17, 0x09, 0x22, 0x02, 0x80, 0x57, 0x00, 0x23, 0x4a, 0x41, 0x10, 0x55, 0x64,
     0x07, 0x20, 0x09, 0xda, 0x83, 0x86, 0x4f, 0xc4, 0x23, 0x08, 0x61, 0x04,
 ];
-const MAINMENU_RLE_COMMAND_CODE_LENGTHS: [u8; 256] = [
-    3, 3, 4, 5, 5, 7, 8, 7, 3, 0, 9, 10, 7, 9, 8, 7, 6, 10, 0, 10, 8, 0, 10, 10, 8, 0, 0, 10, 0, 0,
-    7, 8, 5, 9, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 8, 9, 0, 9, 8, 0, 0, 0, 0, 0, 10, 10,
-    8, 10, 9, 9, 5, 10, 9, 10, 9, 0, 0, 10, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10,
-    0, 0, 0, 0, 9, 10, 5, 10, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 9, 10, 10, 0, 0, 10, 0, 0, 0, 10, 0,
-    10, 8, 0, 0, 10, 7, 9, 8, 6, 4, 8, 9, 9, 9, 9, 10, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0,
-    10, 0, 0, 0, 0, 0, 0, 10, 10, 8, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-    0, 10, 0, 0, 0, 10, 0, 9, 0, 7, 0, 0, 10, 5, 10, 9, 0, 7, 0, 0, 0, 0, 0, 0, 10, 8, 0, 10, 9, 8,
-    9, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 9, 0, 0, 9, 7, 10, 9, 10, 8, 0, 0, 0, 9, 9, 0, 0, 9, 0, 10,
-    0, 9, 0, 0, 0, 8, 9, 0, 0, 7, 9, 8, 9, 6, 8, 7, 7,
-];
-
-fn decode_known_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
-    for (header, code_lengths) in [
-        (
-            STREAMINGWORLD_LITERAL_HEADER,
-            &STREAMINGWORLD_LITERAL_CODE_LENGTHS,
-        ),
-        (
-            MAINMENU_RLE_COMMAND_HEADER,
-            &MAINMENU_RLE_COMMAND_CODE_LENGTHS,
-        ),
-    ] {
-        if payload.starts_with(header) {
-            return table_from_code_lengths(code_lengths).map(|table| (table, header.len()));
-        }
+fn decode_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
+    let mut bits = MsbReader::new(payload);
+    if bits.read(2)? != 0b10 {
+        return None;
     }
-    None
+    let forced_bits = bits.read(2)?;
+    let symbol_count = bits.read(8)?.checked_add(1)?;
+    let fluff = if symbol_count == 256 {
+        0
+    } else {
+        let range = symbol_count.min(257_usize.checked_sub(symbol_count)?);
+        bits.read_truncated(range.checked_mul(2)?)?
+    };
+    let rice_count = symbol_count.checked_add(fluff)?;
+    let mut rice = Vec::with_capacity(rice_count);
+    for _ in 0..rice_count {
+        rice.push(bits.read_unary()?);
+    }
+    for value in rice.iter_mut().take(symbol_count) {
+        *value = value
+            .checked_shl(u32::try_from(forced_bits).ok()?)?
+            .checked_add(bits.read(forced_bits)?)?;
+    }
+
+    let mut lengths = Vec::with_capacity(symbol_count);
+    let mut running_sum = 0x1e_i32;
+    for &encoded in rice.iter().take(symbol_count) {
+        let encoded = i32::try_from(encoded).ok()?;
+        let delta = -(encoded & 1) ^ (encoded >> 1);
+        let length = delta.checked_add(running_sum >> 2)?.checked_add(1)?;
+        if !(1..=11).contains(&length) {
+            return None;
+        }
+        lengths.push(u8::try_from(length).ok()?);
+        running_sum = running_sum.checked_add(delta)?;
+    }
+
+    let mut symbols = Vec::with_capacity(symbol_count);
+    let range_codes = &rice[symbol_count..];
+    let range_count = fluff >> 1;
+    let mut range_code = 0_usize;
+    let mut symbol = 0_usize;
+    if fluff & 1 != 0 {
+        let width = *range_codes.get(range_code)?;
+        range_code += 1;
+        if width >= 8 {
+            return None;
+        }
+        symbol = bits.read(width.checked_add(1)?)? + (1_usize << (width + 1)) - 1;
+    }
+    for _ in 0..range_count {
+        let count_width = *range_codes.get(range_code)?;
+        let space_width = *range_codes.get(range_code.checked_add(1)?)?;
+        range_code += 2;
+        if count_width >= 9 || space_width >= 8 {
+            return None;
+        }
+        let count = bits.read(count_width)? + (1_usize << count_width);
+        let space = bits.read(space_width.checked_add(1)?)? + (1_usize << (space_width + 1)) - 1;
+        let end = symbol.checked_add(count)?.min(256);
+        if end - symbol != count {
+            return None;
+        }
+        symbols.extend(
+            (symbol..end)
+                .map(|value| u8::try_from(value).ok())
+                .collect::<Option<Vec<_>>>()?,
+        );
+        symbol = end.checked_add(space)?;
+    }
+    let remaining = symbol_count.checked_sub(symbols.len())?;
+    let end = symbol.checked_add(remaining)?;
+    if remaining == 0 || symbol >= 256 || end > 256 || range_code != range_codes.len() {
+        return None;
+    }
+    symbols.extend(
+        (symbol..end)
+            .map(|value| u8::try_from(value).ok())
+            .collect::<Option<Vec<_>>>()?,
+    );
+    let table = canonical_huffman_table(&symbols, &lengths)?;
+    Some((table, bits.consumed_bytes()))
 }
 
-fn table_from_code_lengths(code_lengths: &[u8; 256]) -> Option<OldHuffmanTable> {
-    let mut symbols = Vec::new();
-    let mut lengths = Vec::new();
-    for (symbol, &length) in code_lengths.iter().enumerate() {
-        if length != 0 {
-            symbols.push(u8::try_from(symbol).ok()?);
-            lengths.push(length);
-        }
-    }
-    canonical_huffman_table(&symbols, &lengths)
+struct MsbReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
 }
 
-fn decode_contiguous_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
-    const FIVE_SYMBOL_TABLES: &[(&[u8; 5], [u8; 5])] = &[
-        (&[0xa0, 0x40, 0x2b, 0xab, 0xa0], [1, 3, 3, 3, 3]),
-        (&[0xa0, 0x40, 0x2f, 0x7d, 0x40], [1, 2, 3, 4, 4]),
-        (&[0xa0, 0x40, 0x4a, 0xd5, 0x70], [3, 2, 3, 2, 2]),
-        (&[0xa0, 0x40, 0x4a, 0xd7, 0x50], [3, 2, 2, 2, 3]),
-        (&[0xa0, 0x40, 0x4b, 0xaf, 0xe0], [3, 2, 2, 3, 2]),
-        (&[0xa0, 0x40, 0x4b, 0xeb, 0xa0], [2, 2, 2, 3, 3]),
-        (&[0xa0, 0x40, 0x4d, 0xee, 0xa0], [2, 2, 3, 2, 3]),
-        (&[0xa0, 0x40, 0x4f, 0xdf, 0xc0], [2, 2, 3, 3, 2]),
-        (&[0xa0, 0x40, 0x55, 0xfa, 0xe0], [2, 3, 3, 2, 2]),
-        (&[0xa0, 0x40, 0x55, 0xfe, 0xa0], [2, 3, 2, 2, 3]),
-        (&[0xa0, 0x40, 0x55, 0xbe, 0xe0], [3, 3, 2, 2, 2]),
-        (&[0xa0, 0x40, 0x57, 0xff, 0xc0], [2, 3, 2, 3, 2]),
-    ];
-    for &(header, lengths) in FIVE_SYMBOL_TABLES {
-        if payload.starts_with(header)
-            && let Some(table) = canonical_huffman_table(&[0, 1, 2, 3, 4], &lengths)
+impl<'a> MsbReader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, position: 0 }
+    }
+
+    fn read(&mut self, count: usize) -> Option<usize> {
+        if count > usize::BITS as usize
+            || self.position.checked_add(count)? > self.bytes.len().checked_mul(8)?
         {
-            return Some((table, header.len()));
+            return None;
         }
+        let mut value = 0_usize;
+        for _ in 0..count {
+            let byte = self.bytes[self.position / 8];
+            value = value << 1 | usize::from(byte >> (7 - self.position % 8) & 1);
+            self.position += 1;
+        }
+        Some(value)
     }
 
-    for &(alphabet_size, max_start) in &[
-        (5_u8, 250_u8),
-        (8, 248),
-        (16, 240),
-        (32, 0),
-        (64, 0),
-        (128, 0),
-    ] {
-        for start in 0..=max_start {
-            let header = encode_contiguous_new_huffman_header(alphabet_size, start);
-            if payload.starts_with(&header) {
-                let symbols: Vec<u8> = (0..alphabet_size).map(|index| start + index).collect();
-                let lengths = if alphabet_size == 5 {
-                    vec![2, 2, 2, 3, 3]
-                } else {
-                    vec![u8::try_from(alphabet_size.ilog2()).unwrap(); usize::from(alphabet_size)]
-                };
-                return canonical_huffman_table(&symbols, &lengths)
-                    .map(|table| (table, header.len()));
+    fn read_unary(&mut self) -> Option<usize> {
+        let mut value = 0_usize;
+        while self.read(1)? == 0 {
+            value = value.checked_add(1)?;
+            if value > 255 {
+                return None;
             }
         }
+        Some(value)
     }
-    None
+
+    fn read_truncated(&mut self, range: usize) -> Option<usize> {
+        if range <= 1 {
+            return Some(0);
+        }
+        let width = usize::try_from((range - 1).ilog2()).ok()?.checked_add(1)?;
+        let value = self.read(width)?;
+        let cutoff = (1_usize << width).checked_sub(range)?;
+        if value >> 1 >= cutoff {
+            value.checked_sub(cutoff)
+        } else {
+            self.position = self.position.checked_sub(1)?;
+            Some(value >> 1)
+        }
+    }
+
+    fn consumed_bytes(&self) -> usize {
+        self.position.div_ceil(8)
+    }
 }
 
 fn canonical_huffman_table(symbols: &[u8], lengths: &[u8]) -> Option<OldHuffmanTable> {
@@ -2689,6 +2727,18 @@ mod tests {
             super::decode_huffman_table(MAINMENU_RLE_COMMAND_HEADER, 24).unwrap();
         assert_eq!(consumed, MAINMENU_RLE_COMMAND_HEADER.len());
         assert_eq!(table.entries.len(), 117);
+    }
+
+    #[test]
+    fn general_new_huffman_grammar_decodes_stock_tables() {
+        for (header, expected_symbols) in [
+            (STREAMINGWORLD_LITERAL_HEADER, 206),
+            (MAINMENU_RLE_COMMAND_HEADER, 117),
+        ] {
+            let (table, consumed) = super::decode_new_huffman_table(header).unwrap();
+            assert_eq!(consumed, header.len());
+            assert_eq!(table.entries.len(), expected_symbols);
+        }
     }
 
     #[test]

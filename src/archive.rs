@@ -1241,4 +1241,38 @@ mod tests {
             payload
         );
     }
+
+    #[test]
+    #[ignore = "real archive corpus audit; requires ARCHIVE_FIXTURE"]
+    fn clean_decoder_should_decode_every_compressed_archive_segment() {
+        let path = PathBuf::from(std::env::var_os("ARCHIVE_FIXTURE").unwrap());
+        let index = read_archive(&path).unwrap();
+        let mut archive = fs::File::open(path).unwrap();
+        let mut failures = Vec::new();
+        let mut decoded = 0_usize;
+        for (segment_index, &segment) in index.segments.iter().enumerate() {
+            if segment.compressed_size == segment.size {
+                continue;
+            }
+            match read_segment(
+                &mut archive,
+                segment,
+                OsStr::new("intentionally-missing-kraken.dll"),
+                true,
+            ) {
+                Ok(bytes) if bytes.len() == usize::try_from(segment.size).unwrap() => decoded += 1,
+                Ok(bytes) => failures.push(format!(
+                    "segment {segment_index}: decoded {} of {} bytes",
+                    bytes.len(),
+                    segment.size
+                )),
+                Err(error) => failures.push(format!("segment {segment_index}: {error}")),
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "decoded {decoded} compressed segments; failures:\n{}",
+            failures.join("\n")
+        );
+    }
 }
