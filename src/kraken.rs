@@ -583,9 +583,111 @@ fn decode_array(
     let payload_offset = cursor.absolute_offset();
     let payload = cursor.take(compressed_size)?;
     match array_type {
+        2 => decode_huffman_one_partition(payload, decoded_size, payload_offset),
         3 => decode_rle(payload, decoded_size, payload_offset, depth + 1),
         5 => decode_recursive_arrays(payload, decoded_size, payload_offset, depth + 1),
         _ => Err(KrakenError::UnsupportedQuantum { offset: start }),
+    }
+}
+
+fn decode_huffman_one_partition(
+    payload: &[u8],
+    decoded_size: usize,
+    offset: usize,
+) -> Result<Vec<u8>, KrakenError> {
+    // The old-table two-symbol form is useful on its own and, unlike the
+    // remaining table syntaxes, is completely determined by the controlled
+    // vectors: a fixed prefix, two ascending symbols, and a three-bit suffix.
+    // Keep this narrowly validated until the general code-length reader is
+    // implemented; accepting a similar-looking header would silently corrupt
+    // the three interleaved bitstreams.
+    let header = payload.get(..4).ok_or(KrakenError::Truncated { offset })?;
+    let value = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if value & 0xff80_0007 != 0x0080_0000 {
+        return Err(KrakenError::UnsupportedQuantum { offset });
+    }
+    let symbol0 =
+        u8::try_from((value >> 11) & 0xff).map_err(|_| KrakenError::InvalidArray { offset })?;
+    let symbol1 =
+        u8::try_from((value >> 3) & 0xff).map_err(|_| KrakenError::InvalidArray { offset })?;
+    if symbol0 >= symbol1 {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+
+    let split_bytes = payload
+        .get(4..6)
+        .ok_or(KrakenError::Truncated { offset: offset + 4 })?;
+    let first_len = usize::from(u16::from_le_bytes([split_bytes[0], split_bytes[1]]));
+    let streams = payload
+        .get(6..)
+        .ok_or(KrakenError::Truncated { offset: offset + 6 })?;
+    let first_symbols = decoded_size.div_ceil(3);
+    let backward_symbols = decoded_size.saturating_add(1) / 3;
+    let second_symbols = decoded_size / 3;
+    let first_bytes = first_symbols.div_ceil(8);
+    let backward_bytes = backward_symbols.div_ceil(8);
+    let second_bytes = second_symbols.div_ceil(8);
+    if first_len != first_bytes
+        || streams.len()
+            != first_bytes
+                .checked_add(second_bytes)
+                .and_then(|size| size.checked_add(backward_bytes))
+                .ok_or(KrakenError::InvalidArray { offset })?
+    {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+
+    let first = &streams[..first_bytes];
+    let second = &streams[first_bytes..first_bytes + second_bytes];
+    let backward = &streams[first_bytes + second_bytes..];
+    let mut output = Vec::with_capacity(decoded_size);
+    let mut first_bit = 0_usize;
+    let mut second_bit = 0_usize;
+    let mut backward_bit = 0_usize;
+    while output.len() < decoded_size {
+        output.push(huffman_binary_symbol(
+            first, first_bit, false, symbol0, symbol1,
+        ));
+        first_bit += 1;
+        if output.len() == decoded_size {
+            break;
+        }
+        output.push(huffman_binary_symbol(
+            backward,
+            backward_bit,
+            true,
+            symbol0,
+            symbol1,
+        ));
+        backward_bit += 1;
+        if output.len() == decoded_size {
+            break;
+        }
+        output.push(huffman_binary_symbol(
+            second, second_bit, false, symbol0, symbol1,
+        ));
+        second_bit += 1;
+    }
+    Ok(output)
+}
+
+fn huffman_binary_symbol(
+    stream: &[u8],
+    bit_index: usize,
+    reverse_bytes: bool,
+    symbol0: u8,
+    symbol1: u8,
+) -> u8 {
+    let byte_index = bit_index / 8;
+    let byte = if reverse_bytes {
+        stream[stream.len() - 1 - byte_index]
+    } else {
+        stream[byte_index]
+    };
+    if byte >> (bit_index & 7) & 1 == 0 {
+        symbol0
+    } else {
+        symbol1
     }
 }
 
@@ -1331,6 +1433,45 @@ mod tests {
         let mut cursor = Cursor::new(&bytes, 100);
         assert_eq!(decode_array(&mut cursor, Some(4), 0), Ok(vec![1, 2, 3, 4]));
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_old_table_binary_huffman_array() {
+        let bytes = [
+            0x20, 0x01, 0xfc, 0x00, 0x18, // type 2: 24 -> 128
+            0x00, 0x80, 0x00, 0x08, // old-table symbols 0 and 1
+            0x06, 0x00, // first forward stream is six bytes
+            0x73, 0xe8, 0x8f, 0xc9, 0xf7, 0x06, // forward stream 0
+            0x46, 0x24, 0xa4, 0x07, 0xef, 0x02, // forward stream 1
+            0x07, 0xb0, 0xef, 0x2a, 0xab, 0x46, // backward stream
+        ];
+        let mut state = 0x9e37_79b9_u32;
+        let expected: Vec<u8> = (0..128)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0] & 1
+            })
+            .collect();
+        let mut cursor = Cursor::new(&bytes, 0);
+        assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_binary_huffman_stream_boundaries() {
+        let bytes = [
+            0x20, 0x00, 0x3c, 0x00, 0x0f, // type 2: 15 -> 16
+            0x00, 0x80, 0x00, 0x08, // old-table symbols 0 and 1
+            0x03, 0x00, // invalid: first stream should contain one byte
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let mut cursor = Cursor::new(&bytes, 20);
+        assert!(matches!(
+            decode_array(&mut cursor, Some(16), 0),
+            Err(KrakenError::InvalidArray { .. })
+        ));
     }
 
     #[test]

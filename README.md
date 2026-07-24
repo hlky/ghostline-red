@@ -13,8 +13,9 @@ stored inner chunks, stored byte
 arrays, RLE byte arrays, simple recursive array composition, and LZ streams
 with recent or explicitly coded legacy distances across both 128 KiB inner
 chunks. Scaled offsets and their low-digit streams are also supported.
-Extracting streams that use Huffman, tANS, or multi-array composition still
-requires a compatible `kraken.dll`, which is not distributed with this
+The decoder also supports the fully recovered old-table, two-symbol form of
+type-2 Huffman arrays. Other Huffman tables, tANS, or multi-array composition
+still require a compatible `kraken.dll`, which is not distributed with this
 repository.
 
 ## Features

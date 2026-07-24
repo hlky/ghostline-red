@@ -337,14 +337,15 @@ mod tests {
             .collect();
         let mut changed = block.clone();
         changed[17] ^= 1;
-        for (name, payload) in [
+        let cases = [
             ("repeat2", [block.as_slice(), block.as_slice()].concat()),
             (
                 "repeat3",
                 [block.as_slice(), block.as_slice(), block.as_slice()].concat(),
             ),
             ("changed", [block.as_slice(), changed.as_slice()].concat()),
-        ] {
+        ];
+        for (name, payload) in cases {
             let encoded = kraken.compress_validated(&payload).unwrap();
             let mut tail = String::new();
             for byte in encoded.iter().skip(262_130) {
@@ -612,6 +613,62 @@ mod tests {
             println!(
                 "period={period} commands={commands:02x?} offsets={offsets:02x?} lengths={lengths:02x?} suffix={:02x?}",
                 &lz[cursor..]
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room small entropy classifier; requires KRAKEN_DLL"]
+    fn print_oracle_small_entropy_streams() {
+        use std::fmt::Write as _;
+
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let mut cases = Vec::new();
+        for &size in &[32_usize, 64, 128, 255, 256] {
+            for &alphabet in &[2_u8, 3, 4, 5, 8, 16, 32] {
+                cases.push((
+                    format!("alphabet{alphabet}-{size}"),
+                    (0..size)
+                        .map(|index| u8::try_from(index % usize::from(alphabet)).unwrap())
+                        .collect::<Vec<_>>(),
+                ));
+            }
+        }
+        cases.push((
+            "skewed-128".to_owned(),
+            (0..128_usize)
+                .map(|index| u8::from(index % 17 == 0))
+                .collect(),
+        ));
+        for &(left, right) in &[(0_u8, 2_u8), (1, 2), (10, 200), (127, 255)] {
+            cases.push((
+                format!("pair-{left}-{right}"),
+                [left, right].into_iter().cycle().take(128).collect(),
+            ));
+        }
+        let mut binary_state = 0x9e37_79b9_u32;
+        cases.push((
+            "binary-random-128".to_owned(),
+            (0..128)
+                .map(|_| {
+                    binary_state ^= binary_state << 13;
+                    binary_state ^= binary_state >> 17;
+                    binary_state ^= binary_state << 5;
+                    binary_state.to_le_bytes()[0] & 1
+                })
+                .collect(),
+        ));
+        for (name, payload) in cases {
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            let mut hex = String::new();
+            for byte in &encoded {
+                write!(&mut hex, "{byte:02x}").unwrap();
+            }
+            println!(
+                "{name} decoded={} encoded={} {hex}",
+                payload.len(),
+                encoded.len()
             );
         }
     }
