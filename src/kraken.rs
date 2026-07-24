@@ -241,9 +241,9 @@ fn decode_quantum(
             output.extend_from_slice(cursor.take(payload_size)?);
             continue;
         }
-        return Err(KrakenError::UnsupportedQuantum {
-            offset: cursor.absolute_offset(),
-        });
+        let lz_offset = cursor.absolute_offset();
+        let lz_payload = cursor.take(payload_size)?;
+        decode_lz_payload(lz_payload, chunk_size, output, mode, lz_offset)?;
     }
     if !cursor.is_empty() {
         return Err(KrakenError::InvalidQuantum {
@@ -251,6 +251,119 @@ fn decode_quantum(
         });
     }
     Ok(())
+}
+
+fn decode_lz_payload(
+    payload: &[u8],
+    chunk_size: usize,
+    output: &mut Vec<u8>,
+    mode: u32,
+    stream_offset: usize,
+) -> Result<(), KrakenError> {
+    let chunk_end = output
+        .len()
+        .checked_add(chunk_size)
+        .ok_or(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        })?;
+    let mut cursor = Cursor::new(payload, stream_offset);
+    if output.is_empty() {
+        output.extend_from_slice(cursor.take(8)?);
+    }
+    if cursor.peek_byte()? & 0x80 != 0 {
+        return Err(KrakenError::UnsupportedQuantum {
+            offset: cursor.absolute_offset(),
+        });
+    }
+
+    let literals = decode_array(&mut cursor, None, 0)?;
+    let commands = decode_array(&mut cursor, None, 0)?;
+    if commands.len() > chunk_size {
+        return Err(KrakenError::InvalidQuantum {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    if cursor.peek_byte()? & 0x80 != 0 {
+        return Err(KrakenError::UnsupportedQuantum {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    let packed_offsets = decode_array(&mut cursor, None, 0)?;
+    let packed_lengths = decode_array(&mut cursor, None, 0)?;
+    if packed_offsets.len() > commands.len() || packed_lengths.len() > chunk_size / 4 {
+        return Err(KrakenError::InvalidQuantum {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    let suffix_offset = cursor.absolute_offset();
+    let suffix = cursor.remaining();
+    if suffix.is_empty() {
+        return Err(KrakenError::InvalidQuantum {
+            offset: suffix_offset,
+        });
+    }
+    let mut bits = PairedBits::new(suffix, suffix_offset);
+    let extended_count = bits.read_back_gamma_minus_one()?;
+    if extended_count > 512 {
+        return Err(KrakenError::InvalidQuantum {
+            offset: suffix_offset,
+        });
+    }
+    let mut extended = Vec::with_capacity(extended_count);
+    for index in 0..extended_count {
+        extended.push(if index & 1 == 0 {
+            bits.read_front_extended_length()?
+        } else {
+            bits.read_back_extended_length()?
+        });
+    }
+    if !packed_offsets.is_empty() {
+        return Err(KrakenError::UnsupportedQuantum {
+            offset: suffix_offset,
+        });
+    }
+    let long_lengths = expand_long_lengths(&packed_lengths, &extended, suffix_offset)?;
+    execute_lz_commands(
+        output,
+        chunk_end,
+        &literals,
+        &commands,
+        &[],
+        &long_lengths,
+        mode,
+        stream_offset,
+    )
+}
+
+fn expand_long_lengths(
+    packed: &[u8],
+    extended: &[usize],
+    offset: usize,
+) -> Result<Vec<usize>, KrakenError> {
+    let mut extended_cursor = 0_usize;
+    let mut output = Vec::with_capacity(packed.len());
+    for &value in packed {
+        let base = if value == 255 {
+            let value = extended
+                .get(extended_cursor)
+                .copied()
+                .ok_or(KrakenError::InvalidQuantum { offset })?;
+            extended_cursor += 1;
+            value
+                .checked_add(255)
+                .ok_or(KrakenError::InvalidQuantum { offset })?
+        } else {
+            usize::from(value)
+        };
+        output.push(
+            base.checked_add(3)
+                .ok_or(KrakenError::InvalidQuantum { offset })?,
+        );
+    }
+    if extended_cursor != extended.len() {
+        return Err(KrakenError::InvalidQuantum { offset });
+    }
+    Ok(output)
 }
 
 fn decode_array(
@@ -730,6 +843,42 @@ impl<'a> PairedBits<'a> {
         })
     }
 
+    fn read_front_extended_length(&mut self) -> Result<usize, KrakenError> {
+        let mut tier = 0_u32;
+        while self.front_bit()? == 0 {
+            tier += 1;
+            if tier > 25 {
+                return Err(KrakenError::InvalidQuantum {
+                    offset: self.stream_offset,
+                });
+            }
+        }
+        let payload_bits = tier + 6;
+        let payload = self.read_front(payload_bits)?;
+        let base = ((1_u64 << tier) - 1) << 6;
+        usize::try_from(base + u64::from(payload)).map_err(|_| KrakenError::InvalidQuantum {
+            offset: self.stream_offset,
+        })
+    }
+
+    fn read_back_extended_length(&mut self) -> Result<usize, KrakenError> {
+        let mut tier = 0_u32;
+        while self.back_bit()? == 0 {
+            tier += 1;
+            if tier > 25 {
+                return Err(KrakenError::InvalidQuantum {
+                    offset: self.stream_offset,
+                });
+            }
+        }
+        let payload_bits = tier + 6;
+        let payload = self.read_back(payload_bits)?;
+        let base = ((1_u64 << tier) - 1) << 6;
+        usize::try_from(base + u64::from(payload)).map_err(|_| KrakenError::InvalidQuantum {
+            offset: self.stream_offset,
+        })
+    }
+
     fn front_bit(&mut self) -> Result<u8, KrakenError> {
         self.ensure_available()?;
         let byte_index = self.front_bits / 8;
@@ -1020,6 +1169,43 @@ mod tests {
             truncated.read_back_gamma_minus_one(),
             Err(KrakenError::InvalidQuantum { offset: 7 })
         );
+    }
+
+    #[test]
+    fn decodes_forward_extended_lengths() {
+        for (bytes, expected) in [
+            (&[0x80, 0x40][..], 0_usize),
+            (&[0x98, 0x40], 12),
+            (&[0xfe, 0x40], 63),
+            (&[0x40, 0x00, 0x40], 64),
+            (&[0x58, 0x00, 0x40], 112),
+            (&[0x24, 0x00, 0x40], 224),
+            (&[0x11, 0x00, 0x40], 480),
+            (&[0x07, 0x90, 0x00, 0x40], 3_808),
+            (&[0x00, 0x3f, 0xe4, 0x00, 0x40], 130_784),
+        ] {
+            let mut bits = PairedBits::new(bytes, 0);
+            assert_eq!(bits.read_back_gamma_minus_one(), Ok(1));
+            assert_eq!(bits.read_front_extended_length(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn decodes_native_period_eight_lz_vector() {
+        let stream = [
+            0x8c, 0x06, 0x00, 0x00, 0x25, // outer quantum: 38 bytes
+            0x88, 0x00, 0x23, // mode 1 LZ chunk: 35 bytes
+            0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00, // initial history
+            0x00, 0x00, 0x08, // eight stored literals
+            0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00, 0x00, 0x00, 0x01,
+            0x7c, // one command
+            0x00, 0x00, 0x00, // no explicit offsets
+            0x00, 0x00, 0x01, 0xff, // one extended packed length
+            0x00, 0x3f, 0xe4, 0x00, 0x40, // extended value and count
+        ];
+        let seed = [0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00];
+        let expected: Vec<u8> = seed.iter().copied().cycle().take(131_072).collect();
+        assert_eq!(decode(&stream, expected.len()), Ok(expected));
     }
 
     #[test]

@@ -198,6 +198,23 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "clean-room differential test; requires KRAKEN_DLL"]
+    fn clean_room_decodes_native_period_eight_streams() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let seed = [0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00];
+        for size in [288_usize, 300, 352, 512, 1024, 4096, 65_536, 131_072] {
+            let payload: Vec<u8> = seed.iter().copied().cycle().take(size).collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            assert_eq!(
+                crate::kraken::decode(&encoded, size),
+                Ok(payload),
+                "native stream of {size} bytes"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "clean-room compatibility test; requires KRAKEN_DLL"]
     fn native_decoder_accepts_clean_room_encoder() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
@@ -375,7 +392,8 @@ mod tests {
                 write!(&mut hex, "{byte:02x}").unwrap();
             }
             println!(
-                "{name}: lz={lz_size} literal={:?} bytes={hex}",
+                "{name}: head={:02x?} lz={lz_size} literal={:?} bytes={hex}",
+                &encoded[..encoded.len().min(8)],
                 array_header(arrays)
             );
         }
@@ -413,10 +431,7 @@ mod tests {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
         let kraken = Kraken::load(path.as_os_str()).unwrap();
         let seed = [0x00, 0x49, 0x92, 0xdb, 0x24, 0x6d, 0xb6, 0x00];
-        for size in [
-            64_usize, 128, 255, 256, 257, 280, 281, 282, 300, 320, 384, 512, 640, 768, 1024, 4096,
-            16_384, 65_536, 131_072,
-        ] {
+        for size in (283_usize..=400).chain([512, 640, 768, 1024, 4096, 16_384, 65_536, 131_072]) {
             let payload: Vec<u8> = seed.iter().copied().cycle().take(size).collect();
             let encoded = kraken.compress_validated(&payload).unwrap();
             if encoded.starts_with(&[0xcc, 0x06]) || encoded.get(2..5) == Some(&[7, 0xff, 0xff]) {
