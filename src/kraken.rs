@@ -8,9 +8,11 @@
 use thiserror::Error;
 
 const BLOCK_SIZE: usize = 256 * 1024;
+const CHUNK_SIZE: usize = 128 * 1024;
 const RAW_BLOCK_HEADER: [u8; 2] = [0xcc, 0x06];
 const COMPRESSED_BLOCK_HEADER: [u8; 2] = [0x8c, 0x06];
 const MEMSET_QUANTUM: [u8; 3] = [0x07, 0xff, 0xff];
+const MAX_ARRAY_RECURSION: usize = 16;
 
 /// Reports malformed or unsupported Kraken streams.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -24,6 +26,12 @@ pub enum KrakenError {
     /// The stream uses a compressed quantum not implemented by this backend.
     #[error("unsupported compressed Kraken quantum at byte {offset}")]
     UnsupportedQuantum { offset: usize },
+    /// A compressed quantum or inner chunk violates the format grammar.
+    #[error("invalid Kraken quantum at byte {offset}")]
+    InvalidQuantum { offset: usize },
+    /// A byte-array entropy envelope violates the format grammar.
+    #[error("invalid Kraken byte array at byte {offset}")]
+    InvalidArray { offset: usize },
     /// The decoder produced a different amount of data than requested.
     #[error("Kraken stream has trailing data at byte {offset}")]
     TrailingData { offset: usize },
@@ -64,6 +72,10 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
 ///
 /// Returns [`KrakenError`] for truncated input, invalid headers, trailing
 /// bytes, or compressed entropy quanta not yet supported by this backend.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the framing state machine stays linear so cursor movement remains auditable"
+)]
 pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError> {
     let mut input_offset = 0_usize;
     let mut output = Vec::with_capacity(decoded_size);
@@ -75,11 +87,12 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
                 offset: input_offset,
             })?;
         input_offset += 2;
-        if header[1] != 0x06 {
+        if header[1] & 0x7f != 0x06 || header[0] & 0x3f != 0x0c {
             return Err(KrakenError::InvalidHeader {
                 offset: input_offset - 2,
             });
         }
+        let checksummed = header[1] & 0x80 != 0;
         if matches!(header[0], 0x4c | 0xcc) {
             let end = input_offset
                 .checked_add(block_size)
@@ -94,7 +107,7 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
             input_offset = end;
             continue;
         }
-        if !matches!(header[0], 0x0c | 0x8c) {
+        if header[0] & 0x40 != 0 {
             return Err(KrakenError::InvalidHeader {
                 offset: input_offset - 2,
             });
@@ -112,8 +125,19 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
                     offset: input_offset,
                 }
             })?;
-            if quantum_header <= 0x3_ffff && stored_size == block_size {
+            let normal_quantum = quantum_header & 0x3_ffff != 0x3_ffff && quantum_header >> 20 == 0;
+            if normal_quantum && stored_size == block_size {
                 input_offset += 3;
+                if checksummed {
+                    input_offset = input_offset.checked_add(3).ok_or(KrakenError::Truncated {
+                        offset: input_offset,
+                    })?;
+                    if input_offset > input.len() {
+                        return Err(KrakenError::Truncated {
+                            offset: input.len(),
+                        });
+                    }
+                }
                 let end = input_offset
                     .checked_add(stored_size)
                     .ok_or(KrakenError::Truncated {
@@ -127,7 +151,36 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
                 input_offset = end;
                 continue;
             }
+            if normal_quantum && stored_size < block_size {
+                input_offset += 3;
+                if checksummed {
+                    input_offset = input_offset.checked_add(3).ok_or(KrakenError::Truncated {
+                        offset: input_offset,
+                    })?;
+                    if input_offset > input.len() {
+                        return Err(KrakenError::Truncated {
+                            offset: input.len(),
+                        });
+                    }
+                }
+                let end = input_offset
+                    .checked_add(stored_size)
+                    .ok_or(KrakenError::Truncated {
+                        offset: input_offset,
+                    })?;
+                let payload = input.get(input_offset..end).ok_or(KrakenError::Truncated {
+                    offset: input_offset,
+                })?;
+                decode_quantum(payload, block_size, &mut output, input_offset)?;
+                input_offset = end;
+                continue;
+            }
             return Err(KrakenError::UnsupportedQuantum {
+                offset: input_offset,
+            });
+        }
+        if checksummed {
+            return Err(KrakenError::InvalidQuantum {
                 offset: input_offset,
             });
         }
@@ -146,9 +199,349 @@ pub fn decode(input: &[u8], decoded_size: usize) -> Result<Vec<u8>, KrakenError>
     Ok(output)
 }
 
+fn decode_quantum(
+    payload: &[u8],
+    output_size: usize,
+    output: &mut Vec<u8>,
+    stream_offset: usize,
+) -> Result<(), KrakenError> {
+    let output_end = output
+        .len()
+        .checked_add(output_size)
+        .ok_or(KrakenError::InvalidQuantum {
+            offset: stream_offset,
+        })?;
+    let mut cursor = Cursor::new(payload, stream_offset);
+    while output.len() < output_end {
+        let chunk_size = (output_end - output.len()).min(CHUNK_SIZE);
+        let header = cursor.peek_be24()?;
+        if header & 0x80_0000 == 0 {
+            let decoded = decode_array(&mut cursor, Some(chunk_size), 0)?;
+            output.extend_from_slice(&decoded);
+            continue;
+        }
+
+        cursor.advance(3)?;
+        let payload_size =
+            usize::try_from(header & 0x7_ffff).map_err(|_| KrakenError::InvalidQuantum {
+                offset: cursor.absolute_offset(),
+            })?;
+        let mode = (header >> 19) & 0xf;
+        if payload_size > chunk_size || (payload_size < chunk_size && mode > 1) {
+            return Err(KrakenError::InvalidQuantum {
+                offset: cursor.absolute_offset() - 3,
+            });
+        }
+        if payload_size == chunk_size {
+            if mode != 0 {
+                return Err(KrakenError::InvalidQuantum {
+                    offset: cursor.absolute_offset() - 3,
+                });
+            }
+            output.extend_from_slice(cursor.take(payload_size)?);
+            continue;
+        }
+        return Err(KrakenError::UnsupportedQuantum {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    if !cursor.is_empty() {
+        return Err(KrakenError::InvalidQuantum {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    Ok(())
+}
+
+fn decode_array(
+    cursor: &mut Cursor<'_>,
+    required_size: Option<usize>,
+    depth: usize,
+) -> Result<Vec<u8>, KrakenError> {
+    if depth >= MAX_ARRAY_RECURSION {
+        return Err(KrakenError::InvalidArray {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    let start = cursor.absolute_offset();
+    let first = cursor.peek_byte()?;
+    let array_type = (first >> 4) & 7;
+    if array_type > 5 {
+        return Err(KrakenError::InvalidArray { offset: start });
+    }
+
+    if array_type == 0 {
+        let stored_size = if first >= 0x80 {
+            usize::from(cursor.read_be16()? & 0x0fff)
+        } else {
+            let value = cursor.read_be24()?;
+            if value > 0x3_ffff {
+                return Err(KrakenError::InvalidArray { offset: start });
+            }
+            usize::try_from(value).map_err(|_| KrakenError::InvalidArray { offset: start })?
+        };
+        require_array_size(required_size, stored_size, start)?;
+        return Ok(cursor.take(stored_size)?.to_vec());
+    }
+
+    let (compressed_size, decoded_size) = if first >= 0x80 {
+        let value = cursor.read_be24()?;
+        let compressed = value & 0x3ff;
+        let decoded = compressed + ((value >> 10) & 0x3ff) + 1;
+        (
+            usize::try_from(compressed).map_err(|_| KrakenError::InvalidArray { offset: start })?,
+            usize::try_from(decoded).map_err(|_| KrakenError::InvalidArray { offset: start })?,
+        )
+    } else {
+        let type_byte = cursor.read_byte()?;
+        let value = cursor.read_be32()?;
+        let compressed = value & 0x3_ffff;
+        let decoded = (((value >> 18) | (u32::from(type_byte) << 14)) & 0x3_ffff) + 1;
+        if compressed >= decoded {
+            return Err(KrakenError::InvalidArray { offset: start });
+        }
+        (
+            usize::try_from(compressed).map_err(|_| KrakenError::InvalidArray { offset: start })?,
+            usize::try_from(decoded).map_err(|_| KrakenError::InvalidArray { offset: start })?,
+        )
+    };
+    require_array_size(required_size, decoded_size, start)?;
+    let payload_offset = cursor.absolute_offset();
+    let payload = cursor.take(compressed_size)?;
+    match array_type {
+        3 => decode_rle(payload, decoded_size, payload_offset, depth + 1),
+        5 => decode_recursive_arrays(payload, decoded_size, payload_offset, depth + 1),
+        _ => Err(KrakenError::UnsupportedQuantum { offset: start }),
+    }
+}
+
+fn require_array_size(
+    required_size: Option<usize>,
+    actual: usize,
+    offset: usize,
+) -> Result<(), KrakenError> {
+    if required_size.is_some_and(|required| required != actual) {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    Ok(())
+}
+
+fn decode_rle(
+    payload: &[u8],
+    decoded_size: usize,
+    offset: usize,
+    depth: usize,
+) -> Result<Vec<u8>, KrakenError> {
+    if payload.len() == 1 {
+        return Ok(vec![payload[0]; decoded_size]);
+    }
+    if payload.is_empty() {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+
+    let commands = if payload[0] == 0 {
+        payload.to_vec()
+    } else {
+        let mut cursor = Cursor::new(payload, offset);
+        let mut decoded = decode_array(&mut cursor, None, depth)?;
+        decoded.extend_from_slice(cursor.remaining());
+        decoded
+    };
+    let mut front = 0_usize;
+    let mut back = commands.len();
+    let mut output = Vec::with_capacity(decoded_size);
+    let mut rle_byte = 0_u8;
+    while front < back {
+        let command = commands[back - 1];
+        let (literal_count, run_count) = if command == 1 {
+            if front >= back - 1 {
+                return Err(KrakenError::InvalidArray { offset });
+            }
+            rle_byte = commands[front];
+            front += 1;
+            back -= 1;
+            continue;
+        } else if command >= 0x30 {
+            back -= 1;
+            (
+                usize::from(command.wrapping_neg().wrapping_sub(1) & 0xf),
+                usize::from(command >> 4),
+            )
+        } else {
+            if back.saturating_sub(front) < 2 {
+                return Err(KrakenError::InvalidArray { offset });
+            }
+            back -= 2;
+            let word = u16::from_le_bytes([commands[back], commands[back + 1]]);
+            if (0x10..=0x2f).contains(&command) {
+                let value = word
+                    .checked_sub(4096)
+                    .ok_or(KrakenError::InvalidArray { offset })?;
+                (usize::from(value & 0x3f), usize::from(value >> 6))
+            } else if (9..=15).contains(&command) {
+                let value = word
+                    .checked_sub(0x08ff)
+                    .ok_or(KrakenError::InvalidArray { offset })?;
+                (
+                    0,
+                    usize::from(value)
+                        .checked_mul(128)
+                        .ok_or(KrakenError::InvalidArray { offset })?,
+                )
+            } else {
+                let value = word
+                    .checked_sub(511)
+                    .ok_or(KrakenError::InvalidArray { offset })?;
+                (
+                    usize::from(value)
+                        .checked_mul(64)
+                        .ok_or(KrakenError::InvalidArray { offset })?,
+                    0,
+                )
+            }
+        };
+
+        let literal_end = front
+            .checked_add(literal_count)
+            .filter(|end| *end <= back)
+            .ok_or(KrakenError::InvalidArray { offset })?;
+        let new_output_size = output
+            .len()
+            .checked_add(literal_count)
+            .and_then(|size| size.checked_add(run_count))
+            .filter(|size| *size <= decoded_size)
+            .ok_or(KrakenError::InvalidArray { offset })?;
+        output.extend_from_slice(&commands[front..literal_end]);
+        output.resize(new_output_size, rle_byte);
+        front = literal_end;
+    }
+    if output.len() != decoded_size {
+        return Err(KrakenError::InvalidArray { offset });
+    }
+    Ok(output)
+}
+
+fn decode_recursive_arrays(
+    payload: &[u8],
+    decoded_size: usize,
+    offset: usize,
+    depth: usize,
+) -> Result<Vec<u8>, KrakenError> {
+    let mut cursor = Cursor::new(payload, offset);
+    let count_byte = cursor.read_byte()?;
+    let count = usize::from(count_byte & 0x7f);
+    if count < 2 || count_byte & 0x80 != 0 {
+        return Err(KrakenError::UnsupportedQuantum { offset });
+    }
+    let mut output = Vec::with_capacity(decoded_size);
+    for _ in 0..count {
+        let part = decode_array(&mut cursor, None, depth)?;
+        if output.len().saturating_add(part.len()) > decoded_size {
+            return Err(KrakenError::InvalidArray { offset });
+        }
+        output.extend_from_slice(&part);
+    }
+    if !cursor.is_empty() || output.len() != decoded_size {
+        return Err(KrakenError::InvalidArray {
+            offset: cursor.absolute_offset(),
+        });
+    }
+    Ok(output)
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    stream_offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    const fn new(bytes: &'a [u8], stream_offset: usize) -> Self {
+        Self {
+            bytes,
+            position: 0,
+            stream_offset,
+        }
+    }
+
+    fn absolute_offset(&self) -> usize {
+        self.stream_offset.saturating_add(self.position)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.position == self.bytes.len()
+    }
+
+    fn peek_byte(&self) -> Result<u8, KrakenError> {
+        self.bytes
+            .get(self.position)
+            .copied()
+            .ok_or(KrakenError::Truncated {
+                offset: self.absolute_offset(),
+            })
+    }
+
+    fn read_byte(&mut self) -> Result<u8, KrakenError> {
+        let value = self.peek_byte()?;
+        self.position += 1;
+        Ok(value)
+    }
+
+    fn peek_be24(&self) -> Result<u32, KrakenError> {
+        let bytes = self
+            .bytes
+            .get(self.position..self.position.saturating_add(3))
+            .ok_or(KrakenError::Truncated {
+                offset: self.absolute_offset(),
+            })?;
+        Ok(u32::from(bytes[0]) << 16 | u32::from(bytes[1]) << 8 | u32::from(bytes[2]))
+    }
+
+    fn read_be16(&mut self) -> Result<u16, KrakenError> {
+        let bytes = self.take(2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_be24(&mut self) -> Result<u32, KrakenError> {
+        let value = self.peek_be24()?;
+        self.position += 3;
+        Ok(value)
+    }
+
+    fn read_be32(&mut self) -> Result<u32, KrakenError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn advance(&mut self, count: usize) -> Result<(), KrakenError> {
+        self.take(count).map(|_| ())
+    }
+
+    fn take(&mut self, count: usize) -> Result<&'a [u8], KrakenError> {
+        let end = self
+            .position
+            .checked_add(count)
+            .ok_or(KrakenError::Truncated {
+                offset: self.absolute_offset(),
+            })?;
+        let value = self
+            .bytes
+            .get(self.position..end)
+            .ok_or(KrakenError::Truncated {
+                offset: self.absolute_offset(),
+            })?;
+        self.position = end;
+        Ok(value)
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.position..]
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BLOCK_SIZE, KrakenError, decode, encode};
+    use super::{BLOCK_SIZE, Cursor, KrakenError, decode, decode_array, decode_quantum, encode};
 
     #[test]
     fn round_trips_raw_and_constant_blocks() {
@@ -201,12 +594,78 @@ mod tests {
             Err(KrakenError::Truncated { offset: 2 })
         );
         assert_eq!(
-            decode(&[0x8c, 0x06, 4, 0, 0], 1),
+            decode(&[0x8c, 0x06, 0x10, 0, 0], 1),
             Err(KrakenError::UnsupportedQuantum { offset: 2 })
         );
         assert_eq!(
             decode(&[0, 0], 1),
             Err(KrakenError::InvalidHeader { offset: 0 })
+        );
+    }
+
+    #[test]
+    fn decodes_entropy_only_rle_quantum() {
+        let stream = [
+            0x8c, 0x06, // compressed Kraken block
+            0x00, 0x00, 0x05, // six payload bytes
+            0x30, 0x00, 0x3c, 0x00, 0x01, // long RLE envelope: 1 -> 16
+            0xa5,
+        ];
+        assert_eq!(decode(&stream, 16), Ok(vec![0xa5; 16]));
+    }
+
+    #[test]
+    fn decodes_stored_entropy_arrays() {
+        let bytes = [0x00, 0x00, 0x04, 1, 2, 3, 4];
+        let mut cursor = Cursor::new(&bytes, 100);
+        assert_eq!(decode_array(&mut cursor, Some(4), 0), Ok(vec![1, 2, 3, 4]));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_bidirectional_rle_commands() {
+        let bytes = [
+            0x30, 0x00, 0x10, 0x00, 0x03, // type 3: 3 -> 5
+            0x00, b'A', 0x3d, // two literals, then three zero bytes
+        ];
+        let mut cursor = Cursor::new(&bytes, 0);
+        assert_eq!(
+            decode_array(&mut cursor, Some(5), 0),
+            Ok(vec![0, b'A', 0, 0, 0])
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_simple_recursive_array_composition() {
+        let bytes = [
+            0x50, 0x00, 0x3c, 0x00, 0x0d, // type 5: 13 -> 16
+            0x02, // two arrays
+            0x30, 0x00, 0x1c, 0x00, 0x01, b'a', // RLE: 1 -> 8
+            0x30, 0x00, 0x1c, 0x00, 0x01, b'b', // RLE: 1 -> 8
+        ];
+        let mut cursor = Cursor::new(&bytes, 0);
+        assert_eq!(
+            decode_array(&mut cursor, Some(16), 0),
+            Ok([vec![b'a'; 8], vec![b'b'; 8]].concat())
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_stored_lz_chunk() {
+        let payload = [0x80, 0x00, 0x04, 9, 8, 7, 6];
+        let mut output = Vec::new();
+        assert_eq!(decode_quantum(&payload, 4, &mut output, 0), Ok(()));
+        assert_eq!(output, [9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn rejects_recursive_array_depth_bombs() {
+        let mut cursor = Cursor::new(&[0x00, 0x00, 0x00], 0);
+        assert_eq!(
+            decode_array(&mut cursor, None, super::MAX_ARRAY_RECURSION),
+            Err(KrakenError::InvalidArray { offset: 0 })
         );
     }
 }

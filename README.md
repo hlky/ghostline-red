@@ -8,9 +8,10 @@ reimplementing WolvenKit's editors.
 The project is currently tested most heavily on Windows. Packing works without
 a DLL and falls back to uncompressed archive segments. The clean-room Kraken
 backend currently encodes raw blocks and compressed constant blocks and decodes
-those forms. Extracting general game/WolvenKit-compressed Kraken streams still
-requires a compatible `kraken.dll`, which is not distributed with this
-repository.
+those forms. Its decoder additionally handles stored inner chunks, stored byte
+arrays, RLE byte arrays, and simple recursive array composition. Extracting
+streams that use Huffman, tANS, or compressed LZ metadata still requires a
+compatible `kraken.dll`, which is not distributed with this repository.
 
 ## Features
 
@@ -59,7 +60,8 @@ Encode a compatible stream without a DLL:
 & $red kraken-encode '.\input.bin' '.\input.kraken'
 ```
 
-Decode a stream composed of currently supported raw or constant blocks:
+Decode a stream composed of currently supported block, entropy-array, and
+chunk forms:
 
 ```powershell
 & $red kraken-decode '.\input.kraken' '.\roundtrip.bin' --size 1048576

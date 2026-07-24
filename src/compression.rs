@@ -187,6 +187,17 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "clean-room specification vector; requires KRAKEN_DLL"]
+    fn native_decoder_accepts_entropy_rle_vector() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let stream = [
+            0x8c, 0x06, 0x00, 0x00, 0x05, 0x30, 0x00, 0x3c, 0x00, 0x01, 0xa5,
+        ];
+        assert_eq!(kraken.decompress(&stream, 16).unwrap(), vec![0xa5; 16]);
+    }
+
+    #[test]
     #[ignore = "clean-room compatibility test; requires KRAKEN_DLL"]
     fn native_decoder_accepts_clean_room_encoder() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
