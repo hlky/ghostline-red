@@ -8,9 +8,11 @@ reimplementing WolvenKit's editors.
 The project is currently tested most heavily on Windows. Packing works without
 a DLL and falls back to uncompressed archive segments. The clean-room Kraken
 backend encodes raw blocks, compressed constant blocks, and deterministic
-recent-offset LZ streams. Its bounded generic matcher supports one explicit
-distance per 128 KiB chunk, distances from 8 through 16,383, scaled-offset
-suffixes, recent-offset reuse, and extended literal/match lengths. It also
+recent-offset LZ streams. Its bounded generic matcher supports multiple
+explicit distances per 128 KiB chunk, distances from 8 through 16,383,
+scaled-offset suffixes, three-entry move-to-front recent-offset reuse, and
+extended literal/match lengths. A stable-distance fast path avoids building
+the full predecessor map for periodic inputs. It also
 emits native-compatible Huffman chunks for contiguous alphabets of 2–5, 8, or
 16 symbols and zero-based alphabets of 32, 64, or 128 symbols. Its decoder
 additionally handles stored inner chunks, stored byte arrays, RLE byte arrays,
@@ -35,12 +37,13 @@ release build, using a cached 32 MiB corpus with a 97-byte pseudorandom period:
 
 | Path | Warm throughput | Output size |
 |---|---:|---:|
-| Clean Rust encode | ~786 MiB/s | 31,872 bytes |
+| Clean Rust encode | ~700 MiB/s | 31,872 bytes |
 | Native encode through isolated worker | ~135 MiB/s | 9,103 bytes |
 | Clean Rust decode | ~637 MiB/s | 32 MiB |
 
-The fixed-width matcher and bulk overlap-copy pass improved the same clean
-encode/decode measurements from approximately 345/221 MiB/s. These numbers
+The fixed-width matcher, stable-distance path, and bulk overlap-copy pass
+improved the same clean encode/decode measurements from approximately
+345/221 MiB/s. These numbers
 include process startup and cached file I/O and are intended as reproducible
 workflow comparisons, not cycle-level codec microbenchmarks. Compression ratio
 depends heavily on the corpus; the native encoder remains substantially
