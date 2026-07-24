@@ -114,30 +114,56 @@ fn encode_huffman_block(block: &[u8]) -> Option<Vec<u8>> {
 
 fn encode_huffman_array(input: &[u8]) -> Option<Vec<u8>> {
     let (&minimum, &maximum) = (input.iter().min()?, input.iter().max()?);
-    let span = usize::from(maximum) - usize::from(minimum) + 1;
-    let alphabet_size = [2_u8, 3, 4, 5, 8, 16]
-        .into_iter()
-        .find(|&size| span <= usize::from(size))?;
-    let start = minimum.min(u8::MAX - alphabet_size + 1);
-    if usize::from(maximum) >= usize::from(start) + usize::from(alphabet_size) {
-        return None;
+    let mut present = [false; 256];
+    for &byte in input {
+        present[usize::from(byte)] = true;
     }
-    let table = encode_huffman_table(alphabet_size, start)?;
-    let mut first_bits = Vec::new();
-    let mut second_bits = Vec::new();
-    let mut backward_bits = Vec::new();
+    let symbols: Vec<u8> = present
+        .into_iter()
+        .enumerate()
+        .filter(|&(_, is_present)| is_present)
+        .map(|(symbol, _)| u8::try_from(symbol).expect("symbol index fits in a byte"))
+        .collect();
+    if symbols.len() == 1 {
+        return encode_array_envelope(3, &[symbols[0]], input.len());
+    }
+    let span = usize::from(maximum) - usize::from(minimum) + 1;
+    let (alphabet_size, start, table) = if (2..=4).contains(&symbols.len()) {
+        let alphabet_size = u8::try_from(symbols.len()).ok()?;
+        (alphabet_size, 0, encode_old_huffman_table(&symbols)?)
+    } else {
+        let alphabet_size = [5_u8, 8, 16]
+            .into_iter()
+            .find(|&size| span <= usize::from(size))?;
+        let start = minimum.min(u8::MAX - alphabet_size + 1);
+        if usize::from(maximum) >= usize::from(start) + usize::from(alphabet_size) {
+            return None;
+        }
+        (
+            alphabet_size,
+            start,
+            encode_contiguous_new_huffman_header(alphabet_size, start),
+        )
+    };
+    let mut first_bits = LsbWriter::with_capacity(input.len().div_ceil(3));
+    let mut second_bits = LsbWriter::with_capacity(input.len() / 3);
+    let mut backward_bits = LsbWriter::with_capacity(input.len().saturating_add(1) / 3);
     for (index, &symbol) in input.iter().enumerate() {
-        let symbol_index = symbol - start;
+        let symbol_index = if alphabet_size <= 4 {
+            u8::try_from(symbols.binary_search(&symbol).ok()?).ok()?
+        } else {
+            symbol - start
+        };
         let (code, bit_count) = huffman_encoder_code(alphabet_size, symbol_index)?;
         match index % 3 {
-            0 => append_lsb_code(&mut first_bits, code, bit_count),
-            1 => append_lsb_code(&mut backward_bits, code, bit_count),
-            _ => append_lsb_code(&mut second_bits, code, bit_count),
+            0 => first_bits.push(code, bit_count),
+            1 => backward_bits.push(code, bit_count),
+            _ => second_bits.push(code, bit_count),
         }
     }
-    let first = pack_lsb_bits(&first_bits);
-    let second = pack_lsb_bits(&second_bits);
-    let mut backward = pack_lsb_bits(&backward_bits);
+    let first = first_bits.finish();
+    let second = second_bits.finish();
+    let mut backward = backward_bits.finish();
     backward.reverse();
     let mut payload =
         Vec::with_capacity(table.len() + 2 + first.len() + second.len() + backward.len());
@@ -149,13 +175,7 @@ fn encode_huffman_array(input: &[u8]) -> Option<Vec<u8>> {
     if payload.len() >= input.len() || payload.len() > 0x3_ffff || input.len() > 0x3_ffff {
         return None;
     }
-    let decoded_minus_one = u32::try_from(input.len().checked_sub(1)?).ok()?;
-    let compressed = u32::try_from(payload.len()).ok()?;
-    let mut output = Vec::with_capacity(payload.len() + 5);
-    output.push(0x20 | u8::try_from(decoded_minus_one >> 14).ok()?);
-    output.extend_from_slice(&((decoded_minus_one & 0x3fff) << 18 | compressed).to_be_bytes());
-    output.extend_from_slice(&payload);
-    Some(output)
+    encode_array_envelope(2, &payload, input.len())
 }
 
 fn huffman_encoder_code(alphabet_size: u8, symbol_index: u8) -> Option<(u16, u8)> {
@@ -178,47 +198,73 @@ fn huffman_encoder_code(alphabet_size: u8, symbol_index: u8) -> Option<(u16, u8)
     }
 }
 
-fn encode_huffman_table(alphabet_size: u8, start: u8) -> Option<Vec<u8>> {
-    let last = start.checked_add(alphabet_size - 1)?;
-    match alphabet_size {
-        2 => {
-            let value = 0x0080_0000 | u32::from(start) << 11 | u32::from(last) << 3;
+fn encode_old_huffman_table(symbols: &[u8]) -> Option<Vec<u8>> {
+    match symbols {
+        [first, last] => {
+            let value = 0x0080_0000 | u32::from(*first) << 11 | u32::from(*last) << 3;
             Some(value.to_be_bytes().to_vec())
         }
-        3 => {
+        [first, middle, last] => {
             let value = 0x0000_c804_0001_u64
-                | u64::from(start) << 19
-                | u64::from(start + 1) << 10
-                | u64::from(last) << 1;
+                | u64::from(*first) << 19
+                | u64::from(*middle) << 10
+                | u64::from(*last) << 1;
             Some(value.to_be_bytes()[3..].to_vec())
         }
-        4 => {
+        [first, second, third, last] => {
             let value = 0x01_0804_0201_0080_u64
-                | u64::from(start) << 35
-                | u64::from(start + 1) << 26
-                | u64::from(start + 2) << 17
-                | u64::from(last) << 8;
+                | u64::from(*first) << 35
+                | u64::from(*second) << 26
+                | u64::from(*third) << 17
+                | u64::from(*last) << 8;
             Some(value.to_be_bytes()[1..].to_vec())
         }
-        5 | 8 | 16 => Some(encode_contiguous_new_huffman_header(alphabet_size, start)),
         _ => None,
     }
 }
 
-fn append_lsb_code(bits: &mut Vec<bool>, code: u16, bit_count: u8) {
-    for shift in 0..bit_count {
-        bits.push(code >> shift & 1 != 0);
+fn encode_array_envelope(array_type: u8, payload: &[u8], decoded_size: usize) -> Option<Vec<u8>> {
+    if payload.len() >= decoded_size || payload.len() > 0x3_ffff || decoded_size > 0x3_ffff {
+        return None;
     }
+    let decoded_minus_one = u32::try_from(decoded_size.checked_sub(1)?).ok()?;
+    let compressed = u32::try_from(payload.len()).ok()?;
+    let mut output = Vec::with_capacity(payload.len() + 5);
+    output.push(array_type << 4 | u8::try_from(decoded_minus_one >> 14).ok()?);
+    output.extend_from_slice(&((decoded_minus_one & 0x3fff) << 18 | compressed).to_be_bytes());
+    output.extend_from_slice(payload);
+    Some(output)
 }
 
-fn pack_lsb_bits(bits: &[bool]) -> Vec<u8> {
-    let mut output = vec![0_u8; bits.len().div_ceil(8)];
-    for (index, &bit) in bits.iter().enumerate() {
-        if bit {
-            output[index / 8] |= 1 << (index & 7);
+struct LsbWriter {
+    bytes: Vec<u8>,
+    bit_len: usize,
+}
+
+impl LsbWriter {
+    fn with_capacity(symbol_count: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(symbol_count.div_ceil(2)),
+            bit_len: 0,
         }
     }
-    output
+
+    fn push(&mut self, code: u16, bit_count: u8) {
+        for shift in 0..bit_count {
+            if self.bit_len.is_multiple_of(8) {
+                self.bytes.push(0);
+            }
+            if code >> shift & 1 != 0 {
+                let byte = self.bytes.last_mut().expect("a byte was just appended");
+                *byte |= 1 << (self.bit_len & 7);
+            }
+            self.bit_len += 1;
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 fn encode_period_eight_stream(input: &[u8]) -> Vec<u8> {
@@ -1763,6 +1809,24 @@ mod tests {
                     "alphabet {alphabet}, {size}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn sparse_small_alphabets_use_old_huffman_tables() {
+        for symbols in [&[1_u8, 200][..], &[0_u8, 7, 255], &[0_u8, 5, 100, 255]] {
+            let mut state = 0x1f83_d9ab_u32;
+            let payload: Vec<u8> = (0..CHUNK_SIZE)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    symbols[usize::try_from(state).unwrap() % symbols.len()]
+                })
+                .collect();
+            let encoded = encode(&payload);
+            assert!(encoded.len() < payload.len());
+            assert_eq!(decode(&encoded, payload.len()), Ok(payload));
         }
     }
 

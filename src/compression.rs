@@ -319,6 +319,18 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         });
+        let sparse_entropy_cases =
+            [&[1_u8, 200][..], &[0_u8, 7, 255], &[0_u8, 5, 100, 255]].map(|symbols| {
+                let mut state = 0x1f83_d9ab_u32;
+                (0..262_144 + 512)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        symbols[usize::try_from(state).unwrap() % symbols.len()]
+                    })
+                    .collect::<Vec<_>>()
+            });
         for payload in [
             block.clone(),
             vec![0x5a; 262_144],
@@ -327,6 +339,7 @@ mod tests {
         ]
         .into_iter()
         .chain(entropy_cases)
+        .chain(sparse_entropy_cases)
         {
             let encoded = crate::kraken::encode(&payload);
             assert_eq!(kraken.decompress(&encoded, payload.len()).unwrap(), payload);
