@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ghostline_red::{archive, codec, cr2w, localization, schema, writer};
+use ghostline_red::{archive, codec, cr2w, kraken, localization, schema, writer};
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
@@ -24,6 +24,16 @@ enum Command {
     KrakenCompressWorker,
     #[command(hide = true)]
     KrakenDecompressWorker,
+    /// Encode a DLL-free Kraken stream (raw blocks, with constant-block compression).
+    KrakenEncode { input: PathBuf, output: PathBuf },
+    /// Decode a DLL-free Kraken stream supported by the clean-room backend.
+    KrakenDecode {
+        input: PathBuf,
+        output: PathBuf,
+        /// Exact number of uncompressed bytes expected.
+        #[arg(long)]
+        size: usize,
+    },
     /// Pack a loose depot tree into an archive.
     Pack {
         source: PathBuf,
@@ -110,6 +120,25 @@ fn main() -> Result<()> {
             std::io::stdin().read_to_end(&mut input)?;
             let output = archive::decompress_worker(&input, cli.kraken.as_os_str())?;
             std::io::stdout().write_all(&output)?;
+        }
+        Command::KrakenEncode { input, output } => {
+            let decoded =
+                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
+            let encoded = kraken::encode(&decoded);
+            fs::write(&output, encoded)
+                .with_context(|| format!("failed to write {}", output.display()))?;
+        }
+        Command::KrakenDecode {
+            input,
+            output,
+            size,
+        } => {
+            let encoded =
+                fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
+            let decoded = kraken::decode(&encoded, size)
+                .with_context(|| format!("failed to decode {}", input.display()))?;
+            fs::write(&output, decoded)
+                .with_context(|| format!("failed to write {}", output.display()))?;
         }
         Command::Pack { source, output } => {
             fs::create_dir_all(&output)?;

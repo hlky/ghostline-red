@@ -140,4 +140,52 @@ mod tests {
         let compressed = kraken.compress_validated(&payload).unwrap();
         assert!(compressed.len() < payload.len());
     }
+
+    #[test]
+    #[ignore = "clean-room framing probe; requires KRAKEN_DLL"]
+    fn verify_candidate_raw_frames() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for size in [
+            1_usize, 2, 255, 256, 65_535, 65_536, 262_143, 262_144, 262_145, 524_288,
+        ] {
+            let payload: Vec<u8> = (0..size)
+                .map(|index| index.wrapping_mul(73).to_le_bytes()[0])
+                .collect();
+            let mut framed = Vec::with_capacity(size + size.div_ceil(262_144) * 2);
+            for block in payload.chunks(262_144) {
+                framed.extend_from_slice(&[0xcc, 0x06]);
+                framed.extend_from_slice(block);
+            }
+            assert_eq!(
+                kraken.decompress(&framed, payload.len()).unwrap(),
+                payload,
+                "raw frame size {size}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room compatibility test; requires KRAKEN_DLL"]
+    fn native_decoder_accepts_clean_room_encoder() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let block: Vec<u8> = (0..262_144_usize)
+            .map(|index| {
+                let mut value = u64::try_from(index).unwrap().wrapping_add(1);
+                value ^= value << 13;
+                value ^= value >> 7;
+                value ^= value << 17;
+                value.to_le_bytes()[0]
+            })
+            .collect();
+        for payload in [
+            block.clone(),
+            vec![0x5a; 262_144],
+            [block.as_slice(), vec![0xa5; 262_144].as_slice()].concat(),
+        ] {
+            let encoded = crate::kraken::encode(&payload);
+            assert_eq!(kraken.decompress(&encoded, payload.len()).unwrap(), payload);
+        }
+    }
 }

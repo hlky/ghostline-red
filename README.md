@@ -5,9 +5,12 @@ resources. It provides focused command-line workflows for packing, extracting,
 listing, inspecting, serializing, and deserializing game resources without
 reimplementing WolvenKit's editors.
 
-The project is currently tested most heavily on Windows. Archive compression
-and compressed-buffer operations require a compatible `kraken.dll`, which is
-not distributed with this repository.
+The project is currently tested most heavily on Windows. Packing works without
+a DLL and falls back to uncompressed archive segments. The clean-room Kraken
+backend currently encodes raw blocks and compressed constant blocks and decodes
+those forms. Extracting general game/WolvenKit-compressed Kraken streams still
+requires a compatible `kraken.dll`, which is not distributed with this
+repository.
 
 ## Features
 
@@ -21,6 +24,7 @@ not distributed with this repository.
 - Grow CName/import tables and template-backed handle export arrays.
 - Isolate native Kraken work in short-lived worker processes.
 - Validate every compressed payload immediately by decompression.
+- Encode and decode the implemented Kraken subset without a native library.
 
 ## Build
 
@@ -42,6 +46,28 @@ directory as `kraken.dll`:
 $red = '.\target\release\ghostline-red.exe'
 $kraken = 'C:\Tools\WolvenKit\kraken.dll'
 ```
+
+The `--kraken` argument is optional when packing. If the DLL is absent,
+payloads that the clean-room encoder cannot make smaller are stored as ordinary
+uncompressed archive segments.
+
+## Clean-room Kraken commands
+
+Encode a compatible stream without a DLL:
+
+```powershell
+& $red kraken-encode '.\input.bin' '.\input.kraken'
+```
+
+Decode a stream composed of currently supported raw or constant blocks:
+
+```powershell
+& $red kraken-decode '.\input.kraken' '.\roundtrip.bin' --size 1048576
+```
+
+The exact decoded size is required because raw Kraken block framing does not
+store it. Unknown entropy-compressed quantum forms fail closed with an explicit
+error; they are not guessed or partially decoded.
 
 ## Archive commands
 

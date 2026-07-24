@@ -3,7 +3,7 @@
 use crate::{
     binary::ReadLeExt,
     compression::{CompressionError, Kraken},
-    cr2w,
+    cr2w, kraken,
 };
 use rayon::prelude::*;
 use serde::Serialize;
@@ -628,6 +628,9 @@ pub fn decompress_payload_isolated(
     expected_size: usize,
     kraken_path: &OsStr,
 ) -> Result<Vec<u8>, ArchiveError> {
+    if let Ok(output) = kraken::decode(input, expected_size) {
+        return Ok(output);
+    }
     let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
         .arg("--kraken")
@@ -663,7 +666,15 @@ fn compress_batch_isolated(inputs: &[Vec<u8>], kraken_path: &OsStr) -> Vec<Optio
     if inputs.is_empty() {
         return Vec::new();
     }
-    let fallback = || (0..inputs.len()).map(|_| None).collect();
+    let fallback = || {
+        inputs
+            .iter()
+            .map(|input| {
+                let encoded = kraken::encode(input);
+                (encoded.len() < input.len()).then_some(encoded)
+            })
+            .collect()
+    };
     let Ok(executable) = std::env::current_exe() else {
         return fallback();
     };
