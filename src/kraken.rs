@@ -309,6 +309,18 @@ fn decode_lz_payload(
             offset: suffix_offset,
         });
     }
+    let mut explicit_offsets = Vec::with_capacity(packed_offsets.len());
+    for (index, &packed) in packed_offsets.iter().enumerate() {
+        let distance = if index & 1 == 0 {
+            bits.read_front_distance(packed)?
+        } else {
+            bits.read_back_distance(packed)?
+        };
+        let distance = i32::try_from(distance).map_err(|_| KrakenError::InvalidQuantum {
+            offset: suffix_offset,
+        })?;
+        explicit_offsets.push(-distance);
+    }
     let mut extended = Vec::with_capacity(extended_count);
     for index in 0..extended_count {
         extended.push(if index & 1 == 0 {
@@ -317,18 +329,13 @@ fn decode_lz_payload(
             bits.read_back_extended_length()?
         });
     }
-    if !packed_offsets.is_empty() {
-        return Err(KrakenError::UnsupportedQuantum {
-            offset: suffix_offset,
-        });
-    }
     let long_lengths = expand_long_lengths(&packed_lengths, &extended, suffix_offset)?;
     execute_lz_commands(
         output,
         chunk_end,
         &literals,
         &commands,
-        &[],
+        &explicit_offsets,
         &long_lengths,
         mode,
         stream_offset,
@@ -453,7 +460,7 @@ fn decode_rle(
     }
 
     let commands = if payload[0] == 0 {
-        payload.to_vec()
+        payload[1..].to_vec()
     } else {
         let mut cursor = Cursor::new(payload, offset);
         let mut decoded = decode_array(&mut cursor, None, depth)?;
@@ -879,6 +886,18 @@ impl<'a> PairedBits<'a> {
         })
     }
 
+    fn read_front_distance(&mut self, packed: u8) -> Result<usize, KrakenError> {
+        let tier = u32::from(packed >> 4);
+        let extra = self.read_front(tier + 4)?;
+        decode_distance_value(packed, tier, extra, self.stream_offset)
+    }
+
+    fn read_back_distance(&mut self, packed: u8) -> Result<usize, KrakenError> {
+        let tier = u32::from(packed >> 4);
+        let extra = self.read_back(tier + 4)?;
+        decode_distance_value(packed, tier, extra, self.stream_offset)
+    }
+
     fn front_bit(&mut self) -> Result<u8, KrakenError> {
         self.ensure_available()?;
         let byte_index = self.front_bits / 8;
@@ -911,6 +930,17 @@ impl<'a> PairedBits<'a> {
         }
         Ok(())
     }
+}
+
+fn decode_distance_value(
+    packed: u8,
+    tier: u32,
+    extra: u32,
+    offset: usize,
+) -> Result<usize, KrakenError> {
+    let base = 8_u64 + (((1_u64 << tier) - 1) << 8);
+    let distance = base + u64::from(packed & 0xf) + (u64::from(extra) << 4);
+    usize::try_from(distance).map_err(|_| KrakenError::InvalidQuantum { offset })
 }
 
 struct Cursor<'a> {
@@ -1092,8 +1122,8 @@ mod tests {
     #[test]
     fn decodes_bidirectional_rle_commands() {
         let bytes = [
-            0x30, 0x00, 0x10, 0x00, 0x03, // type 3: 3 -> 5
-            0x00, b'A', 0x3d, // two literals, then three zero bytes
+            0x30, 0x00, 0x10, 0x00, 0x04, // type 3: 4 -> 5
+            0x00, 0x00, b'A', 0x3d, // marker, two literals, then three zero bytes
         ];
         let mut cursor = Cursor::new(&bytes, 0);
         assert_eq!(
@@ -1187,6 +1217,21 @@ mod tests {
             let mut bits = PairedBits::new(bytes, 0);
             assert_eq!(bits.read_back_gamma_minus_one(), Ok(1));
             assert_eq!(bits.read_front_extended_length(), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn decodes_legacy_distance_tiers() {
+        for (bytes, packed, count, expected) in [
+            (&[0x00, 0x80][..], 0x01, 0_usize, 9_usize),
+            (&[0x10, 0x80], 0x00, 0, 24),
+            (&[0xf0, 0x80], 0x08, 0, 256),
+            (&[0x3a, 0xd8, 0x80, 0x6a], 0x18, 2, 384),
+            (&[0x3c, 0x66, 0xc0, 0x28, 0x63], 0x28, 2, 1024),
+        ] {
+            let mut bits = PairedBits::new(bytes, 0);
+            assert_eq!(bits.read_back_gamma_minus_one(), Ok(count));
+            assert_eq!(bits.read_front_distance(packed), Ok(expected));
         }
     }
 

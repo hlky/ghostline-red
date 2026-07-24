@@ -215,6 +215,79 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "clean-room differential test; requires KRAKEN_DLL"]
+    fn clean_room_decodes_native_legacy_distance_streams() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for period in [9_usize, 16, 24, 32, 64, 128, 256, 384, 512, 768, 1024] {
+            let mut state = 0x243f_6a88_85a3_08d3_u64;
+            let seed: Vec<u8> = (0..period)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[3]
+                })
+                .collect();
+            let size = period.saturating_mul(2).max(255);
+            let payload: Vec<u8> = seed.into_iter().cycle().take(size).collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            assert_eq!(
+                crate::kraken::decode(&encoded, size),
+                Ok(payload),
+                "native stream with period {period}"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room differential test; requires KRAKEN_DLL"]
+    fn clean_room_decodes_native_common_lz_streams() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let cases: [(&str, Vec<u8>); 4] = [
+            (
+                "ramp",
+                (0..131_072_usize)
+                    .map(|index| index.to_le_bytes()[0])
+                    .collect(),
+            ),
+            (
+                "ramp-two-chunk",
+                (0..262_144_usize)
+                    .map(|index| index.to_le_bytes()[0])
+                    .collect(),
+            ),
+            (
+                "text",
+                b"the quick brown fox jumps over the lazy dog\n"
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(131_072)
+                    .collect(),
+            ),
+            (
+                "text-two-chunk",
+                b"the quick brown fox jumps over the lazy dog\n"
+                    .iter()
+                    .copied()
+                    .cycle()
+                    .take(262_144)
+                    .collect(),
+            ),
+        ];
+        for (name, payload) in cases {
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            assert_eq!(
+                crate::kraken::decode(&encoded, payload.len()),
+                Ok(payload),
+                "{name} stream"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "clean-room compatibility test; requires KRAKEN_DLL"]
     fn native_decoder_accepts_clean_room_encoder() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
@@ -458,6 +531,80 @@ mod tests {
                 cursor += array_span(&lz[cursor..]).unwrap();
             }
             println!("size={size} lz={} suffix={:02x?}", lz.len(), &lz[cursor..]);
+        }
+    }
+
+    #[test]
+    #[ignore = "clean-room legacy-distance classifier; requires KRAKEN_DLL"]
+    fn print_oracle_legacy_distances() {
+        fn stored_array(input: &[u8]) -> Option<(usize, &[u8])> {
+            let first = *input.first()?;
+            if (first >> 4) & 7 != 0 {
+                return None;
+            }
+            let (header, size) = if first >= 0x80 {
+                let word = u16::from_be_bytes([*input.first()?, *input.get(1)?]);
+                (2_usize, usize::from(word & 0x0fff))
+            } else {
+                let word = u32::from_be_bytes([0, *input.first()?, *input.get(1)?, *input.get(2)?]);
+                (3_usize, usize::try_from(word).ok()?)
+            };
+            let end = header.checked_add(size)?;
+            Some((end, input.get(header..end)?))
+        }
+
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for period in [
+            9_usize, 10, 12, 16, 20, 24, 32, 40, 44, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024,
+        ] {
+            let mut state = 0x243f_6a88_85a3_08d3_u64;
+            let seed: Vec<u8> = (0..period)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state.to_le_bytes()[3]
+                })
+                .collect();
+            let output_size = period.saturating_mul(2).max(255);
+            let payload: Vec<u8> = seed.into_iter().cycle().take(output_size).collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            if encoded.starts_with(&[0xcc, 0x06]) {
+                println!("period={period} raw");
+                continue;
+            }
+            let quantum_size = ((usize::from(encoded[2]) << 16
+                | usize::from(encoded[3]) << 8
+                | usize::from(encoded[4]))
+                & 0x3_ffff)
+                + 1;
+            let quantum = &encoded[5..5 + quantum_size];
+            let chunk_size = usize::try_from(
+                u32::from_be_bytes([0, quantum[0], quantum[1], quantum[2]]) & 0x7_ffff,
+            )
+            .unwrap();
+            if chunk_size + 3 > quantum.len() {
+                println!("period={period} entropy");
+                continue;
+            }
+            let lz = &quantum[3..3 + chunk_size];
+            let mut cursor = 8_usize;
+            let Some((literal_span, _)) = stored_array(&lz[cursor..]) else {
+                println!("period={period} compressed-arrays");
+                continue;
+            };
+            cursor += literal_span;
+            let (command_span, commands) = stored_array(&lz[cursor..]).unwrap();
+            cursor += command_span;
+            let (offset_span, offsets) = stored_array(&lz[cursor..]).unwrap();
+            cursor += offset_span;
+            let (length_span, lengths) = stored_array(&lz[cursor..]).unwrap();
+            cursor += length_span;
+            println!(
+                "period={period} commands={commands:02x?} offsets={offsets:02x?} lengths={lengths:02x?} suffix={:02x?}",
+                &lz[cursor..]
+            );
         }
     }
 }

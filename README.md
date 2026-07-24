@@ -10,10 +10,10 @@ a DLL and falls back to uncompressed archive segments. The clean-room Kraken
 backend currently encodes raw blocks and compressed constant blocks and decodes
 those forms. Its decoder additionally handles stored inner chunks, stored byte
 arrays, RLE byte arrays, simple recursive array composition, and LZ streams
-whose matches reuse recent offsets without an explicit distance stream.
-Extracting streams that use Huffman, tANS, or explicit compressed LZ distances
-still requires a compatible `kraken.dll`, which is not distributed with this
-repository.
+with recent or explicitly coded legacy distances across both 128 KiB inner
+chunks. Extracting streams that use Huffman, tANS, scaled offsets, or multi-array
+composition still requires a compatible `kraken.dll`, which is not distributed
+with this repository.
 
 ## Features
 
