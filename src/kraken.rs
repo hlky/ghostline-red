@@ -495,7 +495,7 @@ fn encode_huffman_stream(input: &[u8]) -> Option<Vec<u8>> {
 fn encode_huffman_block(block: &[u8]) -> Option<Vec<u8>> {
     let mut quantum = Vec::new();
     for chunk in block.chunks(CHUNK_SIZE) {
-        quantum.extend_from_slice(&encode_huffman_array(chunk)?);
+        quantum.extend_from_slice(&encode_entropy_array(chunk)?);
     }
     if quantum.is_empty() || quantum.len() >= block.len() || quantum.len() > 0x3_ffff {
         return None;
@@ -505,6 +505,178 @@ fn encode_huffman_block(block: &[u8]) -> Option<Vec<u8>> {
     write_be24(&mut output, u32::try_from(quantum.len() - 1).ok()?);
     output.extend_from_slice(&quantum);
     Some(output)
+}
+
+fn encode_entropy_array(input: &[u8]) -> Option<Vec<u8>> {
+    let huffman = encode_huffman_array(input);
+    let tans = encode_tans_array(input);
+    match (huffman, tans) {
+        (Some(huffman), Some(tans)) if tans.len() < huffman.len() => Some(tans),
+        (Some(huffman), _) => Some(huffman),
+        (None, tans) => tans,
+    }
+}
+
+fn encode_tans_array(input: &[u8]) -> Option<Vec<u8>> {
+    const TABLE_BITS: usize = 8;
+    const TABLE_SIZE: usize = 1 << TABLE_BITS;
+    if input.len() < 5 {
+        return None;
+    }
+    let mut frequencies = [0_usize; 256];
+    for &symbol in input {
+        frequencies[usize::from(symbol)] = frequencies[usize::from(symbol)].checked_add(1)?;
+    }
+    let symbols: Vec<u8> = frequencies
+        .iter()
+        .enumerate()
+        .filter_map(|(symbol, &frequency)| {
+            (frequency != 0)
+                .then(|| u8::try_from(symbol).ok())
+                .flatten()
+        })
+        .collect();
+    if !(2..=9).contains(&symbols.len()) {
+        return None;
+    }
+    let weights = normalize_tans_weights(&symbols, &frequencies, TABLE_SIZE)?;
+    let mut table_weights = weights.clone();
+    table_weights.sort_unstable();
+    let table = build_tans_table(&table_weights, TABLE_BITS)?;
+    let mut symbol_rows = [None; 256];
+    for (row, &(symbol, _)) in table_weights.iter().enumerate() {
+        symbol_rows[usize::from(symbol)] = Some(row);
+    }
+    let mut inverse = vec![[None; TABLE_SIZE]; table_weights.len()];
+    for (previous, entry) in table.iter().enumerate() {
+        for current in entry.base..=entry.base.checked_add(entry.mask)? {
+            let slot = inverse
+                .get_mut(symbol_rows[usize::from(entry.symbol)]?)?
+                .get_mut(current)?;
+            if slot.is_none() {
+                *slot = Some((previous, current - entry.base, entry.bits));
+            }
+        }
+    }
+
+    let body_size = input.len() - 5;
+    let mut events = Vec::with_capacity(body_size);
+    let mut position = 0_usize;
+    while position < body_size {
+        for side in [false, true] {
+            for state in 0..5 {
+                if position == body_size {
+                    break;
+                }
+                events.push((state, side, input[position]));
+                position += 1;
+            }
+        }
+    }
+    let mut states: [usize; 5] = std::array::from_fn(|index| usize::from(input[body_size + index]));
+    let mut encoded_events = vec![(false, 0_u16, 0_u8); body_size];
+    for (index, &(state, side, symbol)) in events.iter().enumerate().rev() {
+        let (previous, value, bit_count) = inverse[symbol_rows[usize::from(symbol)]?]
+            .get(states[state])?
+            .as_ref()
+            .copied()?;
+        encoded_events[index] = (
+            side,
+            u16::try_from(value).ok()?,
+            u8::try_from(bit_count).ok()?,
+        );
+        states[state] = previous;
+    }
+
+    let mut front = LsbWriter::with_capacity(input.len());
+    let mut back = LsbWriter::with_capacity(input.len());
+    let table_bits = u8::try_from(TABLE_BITS).ok()?;
+    front.push(u16::try_from(states[0]).ok()?, table_bits);
+    back.push(u16::try_from(states[1]).ok()?, table_bits);
+    front.push(u16::try_from(states[2]).ok()?, table_bits);
+    back.push(u16::try_from(states[3]).ok()?, table_bits);
+    front.push(u16::try_from(states[4]).ok()?, table_bits);
+    for (side, value, bit_count) in encoded_events {
+        if side {
+            back.push(value, bit_count);
+        } else {
+            front.push(value, bit_count);
+        }
+    }
+    let mut payload = encode_tans_header(&weights, TABLE_BITS)?;
+    payload.extend(front.finish());
+    let mut back = back.finish();
+    back.reverse();
+    payload.extend(back);
+    encode_array_envelope(1, &payload, input.len())
+}
+
+fn normalize_tans_weights(
+    symbols: &[u8],
+    frequencies: &[usize; 256],
+    table_size: usize,
+) -> Option<Vec<(u8, usize)>> {
+    let remaining = table_size.checked_sub(symbols.len())?;
+    let total = symbols.iter().try_fold(0_usize, |total, &symbol| {
+        total.checked_add(frequencies[usize::from(symbol)])
+    })?;
+    let mut allocated = 0_usize;
+    let mut weights = Vec::with_capacity(symbols.len());
+    let mut remainders = Vec::with_capacity(symbols.len());
+    for &symbol in symbols {
+        let scaled = frequencies[usize::from(symbol)].checked_mul(remaining)?;
+        let extra = scaled / total;
+        allocated = allocated.checked_add(extra)?;
+        weights.push((symbol, extra + 1));
+        remainders.push((scaled % total, symbol));
+    }
+    remainders.sort_unstable_by_key(|&(remainder, symbol)| (std::cmp::Reverse(remainder), symbol));
+    for &(_, symbol) in remainders.iter().take(remaining.checked_sub(allocated)?) {
+        weights[symbols.binary_search(&symbol).ok()?].1 += 1;
+    }
+    weights.sort_unstable_by_key(|&(symbol, weight)| (weight, symbol));
+    Some(weights)
+}
+
+fn encode_tans_header(weights: &[(u8, usize)], table_bits: usize) -> Option<Vec<u8>> {
+    if !(2..=9).contains(&weights.len()) || !(8..=11).contains(&table_bits) {
+        return None;
+    }
+    let mut previous = 0_usize;
+    let maximum_delta = weights
+        .iter()
+        .take(weights.len() - 1)
+        .map(|&(_, weight)| {
+            let delta = weight.checked_sub(previous)?;
+            previous = weight;
+            Some(delta)
+        })
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .max()?;
+    let delta_bits = usize::try_from(maximum_delta.ilog2())
+        .ok()?
+        .checked_add(1)?;
+    if delta_bits > table_bits {
+        return None;
+    }
+    let mut bits = MsbBits::new();
+    bits.push_bit(false);
+    bits.push_value(u32::try_from(table_bits - 8).ok()?, 2);
+    bits.push_bit(false);
+    bits.push_value(u32::try_from(weights.len() - 2).ok()?, 3);
+    bits.push_value(u32::try_from(delta_bits).ok()?, 4);
+    previous = 0;
+    for &(symbol, weight) in weights.iter().take(weights.len() - 1) {
+        bits.push_value(u32::from(symbol), 8);
+        bits.push_value(
+            u32::try_from(weight.checked_sub(previous)?).ok()?,
+            u32::try_from(delta_bits).ok()?,
+        );
+        previous = weight;
+    }
+    bits.push_value(u32::from(weights.last()?.0), 8);
+    Some(bits.finish())
 }
 
 fn encode_huffman_array(input: &[u8]) -> Option<Vec<u8>> {
@@ -3106,6 +3278,38 @@ mod tests {
             assert!(encoded.len() < payload.len());
             assert_eq!(decode(&encoded, payload.len()), Ok(payload));
         }
+    }
+
+    #[test]
+    fn encodes_compact_tans_arrays() {
+        let mut encoded_cases = 0;
+        let mut selected_cases = 0;
+        for alphabet in [2_u8, 3, 5, 9] {
+            let mut state = 0x6a09_e667_u32 ^ u32::from(alphabet);
+            let payload: Vec<u8> = (0..CHUNK_SIZE)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state.to_le_bytes()[0] % alphabet
+                })
+                .collect();
+            if let Some(encoded) = super::encode_tans_array(&payload) {
+                encoded_cases += 1;
+                let mut cursor = super::Cursor::new(&encoded, 0);
+                assert_eq!(
+                    super::decode_array(&mut cursor, Some(payload.len()), 0),
+                    Ok(payload.clone())
+                );
+                assert!(cursor.is_empty());
+            }
+            if super::encode_entropy_array(&payload).is_some_and(|encoded| encoded[0] >> 4 & 7 == 1)
+            {
+                selected_cases += 1;
+            }
+        }
+        assert!(encoded_cases >= 3);
+        assert!(selected_cases >= 1);
     }
 
     #[test]
