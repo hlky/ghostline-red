@@ -11,9 +11,10 @@ backend currently encodes raw blocks and compressed constant blocks and decodes
 those forms. Its decoder additionally handles stored inner chunks, stored byte
 arrays, RLE byte arrays, simple recursive array composition, and LZ streams
 with recent or explicitly coded legacy distances across both 128 KiB inner
-chunks. Extracting streams that use Huffman, tANS, scaled offsets, or multi-array
-composition still requires a compatible `kraken.dll`, which is not distributed
-with this repository.
+chunks. Scaled offsets and their low-digit streams are also supported.
+Extracting streams that use Huffman, tANS, or multi-array composition still
+requires a compatible `kraken.dll`, which is not distributed with this
+repository.
 
 ## Features
 

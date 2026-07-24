@@ -283,12 +283,17 @@ fn decode_lz_payload(
             offset: cursor.absolute_offset(),
         });
     }
-    if cursor.peek_byte()? & 0x80 != 0 {
-        return Err(KrakenError::UnsupportedQuantum {
-            offset: cursor.absolute_offset(),
-        });
-    }
+    let offset_scale = if cursor.peek_byte()? & 0x80 != 0 {
+        usize::from(cursor.read_byte()? - 127)
+    } else {
+        0
+    };
     let packed_offsets = decode_array(&mut cursor, None, 0)?;
+    let low_digits = if offset_scale > 1 {
+        decode_array(&mut cursor, Some(packed_offsets.len()), 0)?
+    } else {
+        Vec::new()
+    };
     let packed_lengths = decode_array(&mut cursor, None, 0)?;
     if packed_offsets.len() > commands.len() || packed_lengths.len() > chunk_size / 4 {
         return Err(KrakenError::InvalidQuantum {
@@ -309,18 +314,13 @@ fn decode_lz_payload(
             offset: suffix_offset,
         });
     }
-    let mut explicit_offsets = Vec::with_capacity(packed_offsets.len());
-    for (index, &packed) in packed_offsets.iter().enumerate() {
-        let distance = if index & 1 == 0 {
-            bits.read_front_distance(packed)?
-        } else {
-            bits.read_back_distance(packed)?
-        };
-        let distance = i32::try_from(distance).map_err(|_| KrakenError::InvalidQuantum {
-            offset: suffix_offset,
-        })?;
-        explicit_offsets.push(-distance);
-    }
+    let explicit_offsets = decode_explicit_offsets(
+        &mut bits,
+        &packed_offsets,
+        &low_digits,
+        offset_scale,
+        suffix_offset,
+    )?;
     let mut extended = Vec::with_capacity(extended_count);
     for index in 0..extended_count {
         extended.push(if index & 1 == 0 {
@@ -340,6 +340,53 @@ fn decode_lz_payload(
         mode,
         stream_offset,
     )
+}
+
+fn decode_explicit_offsets(
+    bits: &mut PairedBits<'_>,
+    packed_offsets: &[u8],
+    low_digits: &[u8],
+    offset_scale: usize,
+    suffix_offset: usize,
+) -> Result<Vec<i32>, KrakenError> {
+    let mut output = Vec::with_capacity(packed_offsets.len());
+    for (index, &packed) in packed_offsets.iter().enumerate() {
+        let stored_offset = if offset_scale == 0 {
+            let distance = if index & 1 == 0 {
+                bits.read_front_distance(packed)?
+            } else {
+                bits.read_back_distance(packed)?
+            };
+            let distance = i32::try_from(distance).map_err(|_| KrakenError::InvalidQuantum {
+                offset: suffix_offset,
+            })?;
+            -distance
+        } else {
+            let raw_offset = if index & 1 == 0 {
+                bits.read_front_scaled_offset(packed)?
+            } else {
+                bits.read_back_scaled_offset(packed)?
+            };
+            let low = low_digits.get(index).copied().unwrap_or(0);
+            raw_offset
+                .checked_mul(i32::try_from(offset_scale).map_err(|_| {
+                    KrakenError::InvalidQuantum {
+                        offset: suffix_offset,
+                    }
+                })?)
+                .and_then(|value| value.checked_sub(i32::from(low)))
+                .ok_or(KrakenError::InvalidQuantum {
+                    offset: suffix_offset,
+                })?
+        };
+        if stored_offset >= 0 {
+            return Err(KrakenError::InvalidQuantum {
+                offset: suffix_offset,
+            });
+        }
+        output.push(stored_offset);
+    }
+    Ok(output)
 }
 
 fn expand_long_lengths(
@@ -898,6 +945,18 @@ impl<'a> PairedBits<'a> {
         decode_distance_value(packed, tier, extra, self.stream_offset)
     }
 
+    fn read_front_scaled_offset(&mut self, command: u8) -> Result<i32, KrakenError> {
+        let bit_count = u32::from(command >> 3);
+        let extra = self.read_front(bit_count)?;
+        decode_scaled_offset_value(command, bit_count, extra, self.stream_offset)
+    }
+
+    fn read_back_scaled_offset(&mut self, command: u8) -> Result<i32, KrakenError> {
+        let bit_count = u32::from(command >> 3);
+        let extra = self.read_back(bit_count)?;
+        decode_scaled_offset_value(command, bit_count, extra, self.stream_offset)
+    }
+
     fn front_bit(&mut self) -> Result<u8, KrakenError> {
         self.ensure_available()?;
         let byte_index = self.front_bits / 8;
@@ -941,6 +1000,25 @@ fn decode_distance_value(
     let base = 8_u64 + (((1_u64 << tier) - 1) << 8);
     let distance = base + u64::from(packed & 0xf) + (u64::from(extra) << 4);
     usize::try_from(distance).map_err(|_| KrakenError::InvalidQuantum { offset })
+}
+
+fn decode_scaled_offset_value(
+    command: u8,
+    bit_count: u32,
+    extra: u32,
+    offset: usize,
+) -> Result<i32, KrakenError> {
+    if bit_count > 26 {
+        return Err(KrakenError::InvalidQuantum { offset });
+    }
+    let base = 8_u32 + u32::from(command & 7);
+    let value = base
+        .checked_shl(bit_count)
+        .and_then(|value| value.checked_add(extra))
+        .ok_or(KrakenError::InvalidQuantum { offset })?;
+    8_i32
+        .checked_sub(i32::try_from(value).map_err(|_| KrakenError::InvalidQuantum { offset })?)
+        .ok_or(KrakenError::InvalidQuantum { offset })
 }
 
 struct Cursor<'a> {
@@ -1036,8 +1114,8 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array, decode_quantum, encode,
-        execute_lz_commands,
+        BLOCK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array, decode_lz_payload,
+        decode_quantum, decode_scaled_offset_value, encode, execute_lz_commands,
     };
 
     #[test]
@@ -1233,6 +1311,34 @@ mod tests {
             assert_eq!(bits.read_back_gamma_minus_one(), Ok(count));
             assert_eq!(bits.read_front_distance(packed), Ok(expected));
         }
+    }
+
+    #[test]
+    fn decodes_scaled_offset_values() {
+        assert_eq!(decode_scaled_offset_value(0x08, 1, 0, 0), Ok(-8));
+        assert_eq!(decode_scaled_offset_value(0x08, 1, 1, 0), Ok(-9));
+        assert_eq!(decode_scaled_offset_value(0x10, 2, 0, 0), Ok(-24));
+        assert_eq!(
+            decode_scaled_offset_value(0xd8, 27, 0, 9),
+            Err(KrakenError::InvalidQuantum { offset: 9 })
+        );
+    }
+
+    #[test]
+    fn decodes_scaled_offset_lz_payload() {
+        let payload = [
+            b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h', // initial history
+            0x00, 0x00, 0x00, // no literals
+            0x00, 0x00, 0x01, 0xc8, // one explicit-offset, four-byte match
+            0x81, // scaled offsets, scale 2
+            0x00, 0x00, 0x01, 0x04, // raw scaled offset -4
+            0x00, 0x00, 0x01, 0x00, // low digit 0: -4 * 2 = -8
+            0x00, 0x00, 0x00, // no long lengths
+            0x80, // no extended lengths or offset bits
+        ];
+        let mut output = Vec::new();
+        assert_eq!(decode_lz_payload(&payload, 12, &mut output, 1, 0), Ok(()));
+        assert_eq!(output, b"abcdefghabcd");
     }
 
     #[test]
