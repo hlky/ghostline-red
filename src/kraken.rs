@@ -1021,6 +1021,28 @@ fn decode_huffman_table(
 }
 
 fn decode_contiguous_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
+    const FIVE_SYMBOL_TABLES: &[(&[u8; 5], [u8; 5])] = &[
+        (&[0xa0, 0x40, 0x2b, 0xab, 0xa0], [1, 3, 3, 3, 3]),
+        (&[0xa0, 0x40, 0x2f, 0x7d, 0x40], [1, 2, 3, 4, 4]),
+        (&[0xa0, 0x40, 0x4a, 0xd5, 0x70], [3, 2, 3, 2, 2]),
+        (&[0xa0, 0x40, 0x4a, 0xd7, 0x50], [3, 2, 2, 2, 3]),
+        (&[0xa0, 0x40, 0x4b, 0xaf, 0xe0], [3, 2, 2, 3, 2]),
+        (&[0xa0, 0x40, 0x4b, 0xeb, 0xa0], [2, 2, 2, 3, 3]),
+        (&[0xa0, 0x40, 0x4d, 0xee, 0xa0], [2, 2, 3, 2, 3]),
+        (&[0xa0, 0x40, 0x4f, 0xdf, 0xc0], [2, 2, 3, 3, 2]),
+        (&[0xa0, 0x40, 0x55, 0xfa, 0xe0], [2, 3, 3, 2, 2]),
+        (&[0xa0, 0x40, 0x55, 0xfe, 0xa0], [2, 3, 2, 2, 3]),
+        (&[0xa0, 0x40, 0x55, 0xbe, 0xe0], [3, 3, 2, 2, 2]),
+        (&[0xa0, 0x40, 0x57, 0xff, 0xc0], [2, 3, 2, 3, 2]),
+    ];
+    for &(header, lengths) in FIVE_SYMBOL_TABLES {
+        if payload.starts_with(header)
+            && let Some(table) = canonical_huffman_table(&[0, 1, 2, 3, 4], &lengths)
+        {
+            return Some((table, header.len()));
+        }
+    }
+
     for &(alphabet_size, max_start) in &[
         (5_u8, 250_u8),
         (8, 248),
@@ -1032,31 +1054,49 @@ fn decode_contiguous_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTabl
         for start in 0..=max_start {
             let header = encode_contiguous_new_huffman_header(alphabet_size, start);
             if payload.starts_with(&header) {
-                let entries = if alphabet_size == 5 {
-                    [(0b00, 2), (0b10, 2), (0b01, 2), (0b011, 3), (0b111, 3)]
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, (code, length))| {
-                            (code, length, start + u8::try_from(index).unwrap())
-                        })
-                        .collect()
+                let symbols: Vec<u8> = (0..alphabet_size).map(|index| start + index).collect();
+                let lengths = if alphabet_size == 5 {
+                    vec![2, 2, 2, 3, 3]
                 } else {
-                    let bit_length = u8::try_from(alphabet_size.ilog2()).unwrap();
-                    (0..alphabet_size)
-                        .map(|index| {
-                            (
-                                reverse_low_bits(u16::from(index), bit_length),
-                                bit_length,
-                                start + index,
-                            )
-                        })
-                        .collect()
+                    vec![u8::try_from(alphabet_size.ilog2()).unwrap(); usize::from(alphabet_size)]
                 };
-                return Some((OldHuffmanTable { entries }, header.len()));
+                return canonical_huffman_table(&symbols, &lengths)
+                    .map(|table| (table, header.len()));
             }
         }
     }
     None
+}
+
+fn canonical_huffman_table(symbols: &[u8], lengths: &[u8]) -> Option<OldHuffmanTable> {
+    if symbols.len() != lengths.len() || symbols.is_empty() {
+        return None;
+    }
+    let kraft_slots = lengths.iter().try_fold(0_u32, |slots, &length| {
+        if !(1..=11).contains(&length) {
+            return None;
+        }
+        slots.checked_add(1_u32 << (11 - length))
+    })?;
+    if kraft_slots != 1 << 11 {
+        return None;
+    }
+    let mut ordered: Vec<(u8, u8)> = symbols
+        .iter()
+        .copied()
+        .zip(lengths.iter().copied())
+        .collect();
+    ordered.sort_unstable_by_key(|&(symbol, length)| (length, symbol));
+    let mut code = 0_u16;
+    let mut previous_length = 0_u8;
+    let mut entries = Vec::with_capacity(ordered.len());
+    for (symbol, length) in ordered {
+        code = code.checked_shl(u32::from(length - previous_length))?;
+        entries.push((reverse_low_bits(code, length), length, symbol));
+        code = code.checked_add(1)?;
+        previous_length = length;
+    }
+    Some(OldHuffmanTable { entries })
 }
 
 fn reverse_low_bits(mut value: u16, bit_count: u8) -> u16 {
@@ -1768,8 +1808,9 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_SIZE, CHUNK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array,
-        decode_lz_payload, decode_quantum, decode_rle, decode_scaled_offset_value, encode,
+        BLOCK_SIZE, CHUNK_SIZE, Cursor, KrakenError, LsbWriter, PairedBits,
+        canonical_huffman_table, decode, decode_array, decode_lz_payload, decode_quantum,
+        decode_rle, decode_scaled_offset_value, encode, encode_array_envelope,
         encode_contiguous_new_huffman_header, encode_extended_length, execute_lz_commands,
     };
 
@@ -2016,6 +2057,43 @@ mod tests {
         deterministic_shuffle(&mut expected, 0x299f_31d0);
         let mut cursor = Cursor::new(&bytes, 0);
         assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_nonuniform_new_five_symbol_huffman_table() {
+        let input: Vec<u8> = (0..128)
+            .map(|index| u8::try_from(index % 5).unwrap())
+            .collect();
+        let table = canonical_huffman_table(&[0, 1, 2, 3, 4], &[1, 2, 3, 4, 4]).unwrap();
+        let mut forward_zero = LsbWriter::with_capacity(32);
+        let mut forward_one = LsbWriter::with_capacity(32);
+        let mut backward = LsbWriter::with_capacity(32);
+        for (index, &symbol) in input.iter().enumerate() {
+            let &(code, length, _) = table
+                .entries
+                .iter()
+                .find(|&&(_, _, entry_symbol)| entry_symbol == symbol)
+                .unwrap();
+            match index % 3 {
+                0 => forward_zero.push(code, length),
+                1 => backward.push(code, length),
+                _ => forward_one.push(code, length),
+            }
+        }
+        let forward_zero = forward_zero.finish();
+        let forward_one = forward_one.finish();
+        let mut backward = backward.finish();
+        backward.reverse();
+        let mut payload = vec![0xa0, 0x40, 0x2f, 0x7d, 0x40];
+        payload.extend_from_slice(&u16::try_from(forward_zero.len()).unwrap().to_le_bytes());
+        payload.extend_from_slice(&forward_zero);
+        payload.extend_from_slice(&forward_one);
+        payload.extend_from_slice(&backward);
+        let encoded = encode_array_envelope(2, &payload, input.len()).unwrap();
+        let mut cursor = Cursor::new(&encoded, 0);
+
+        assert_eq!(decode_array(&mut cursor, Some(input.len()), 0), Ok(input));
         assert!(cursor.is_empty());
     }
 

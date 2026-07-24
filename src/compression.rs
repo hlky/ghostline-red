@@ -384,6 +384,44 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "clean-room nonuniform Huffman differential test; requires KRAKEN_DLL"]
+    fn clean_room_decodes_native_nonuniform_five_symbol_tables() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for weights in [
+            [1_u32, 1, 1, 1, 1],
+            [2, 1, 1, 1, 1],
+            [4, 2, 1, 1, 1],
+            [8, 4, 2, 1, 1],
+            [5, 4, 3, 2, 1],
+        ] {
+            let total: u32 = weights.iter().sum();
+            let mut state = 0x510e_527f_u32 ^ total;
+            let payload: Vec<u8> = (0..4_096)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    let mut selection = state % total;
+                    for (symbol, &weight) in weights.iter().enumerate() {
+                        if selection < weight {
+                            return u8::try_from(symbol).unwrap();
+                        }
+                        selection -= weight;
+                    }
+                    unreachable!()
+                })
+                .collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            assert_eq!(
+                crate::kraken::decode(&encoded, payload.len()),
+                Ok(payload),
+                "weights {weights:?}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "clean-room type-4 Huffman differential test; requires KRAKEN_DLL"]
     fn clean_room_decodes_native_type_four_huffman_partitions() {
         let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
