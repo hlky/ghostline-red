@@ -1438,21 +1438,53 @@ const STREAMINGWORLD_LITERAL_CODE_LENGTHS: [u8; 256] = [
     8, 9, 8, 0, 9, 10, 10, 0, 10, 0, 9, 0, 9, 9, 10, 10, 0, 8, 9, 0, 9, 9, 8, 0, 8, 10, 10, 8, 0,
     10, 0, 10, 0, 8, 0, 10, 10, 0, 9, 8, 10, 9, 9, 0, 0, 9, 9,
 ];
+const MAINMENU_RLE_COMMAND_HEADER: &[u8] = &[
+    0x97, 0x46, 0xc0, 0x8b, 0x92, 0x88, 0x86, 0x74, 0x4c, 0xb5, 0x95, 0x2f, 0x96, 0xe2, 0x6d, 0x5a,
+    0x12, 0xd7, 0xab, 0x91, 0x4a, 0xa5, 0x5a, 0xba, 0x89, 0xa6, 0x7a, 0xeb, 0x7d, 0xeb, 0x4f, 0x18,
+    0xdb, 0xce, 0xda, 0xd4, 0x76, 0x69, 0xcb, 0xbb, 0x16, 0x6b, 0x8d, 0xfc, 0xeb, 0x3b, 0x72, 0xbf,
+    0xaf, 0x82, 0x0c, 0x17, 0x09, 0x22, 0x02, 0x80, 0x57, 0x00, 0x23, 0x4a, 0x41, 0x10, 0x55, 0x64,
+    0x07, 0x20, 0x09, 0xda, 0x83, 0x86, 0x4f, 0xc4, 0x23, 0x08, 0x61, 0x04,
+];
+const MAINMENU_RLE_COMMAND_CODE_LENGTHS: [u8; 256] = [
+    3, 3, 4, 5, 5, 7, 8, 7, 3, 0, 9, 10, 7, 9, 8, 7, 6, 10, 0, 10, 8, 0, 10, 10, 8, 0, 0, 10, 0, 0,
+    7, 8, 5, 9, 0, 0, 9, 0, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 8, 9, 0, 9, 8, 0, 0, 0, 0, 0, 10, 10,
+    8, 10, 9, 9, 5, 10, 9, 10, 9, 0, 0, 10, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10,
+    0, 0, 0, 0, 9, 10, 5, 10, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 9, 10, 10, 0, 0, 10, 0, 0, 0, 10, 0,
+    10, 8, 0, 0, 10, 7, 9, 8, 6, 4, 8, 9, 9, 9, 9, 10, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0,
+    10, 0, 0, 0, 0, 0, 0, 10, 10, 8, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 10, 0, 0, 0, 10, 0, 9, 0, 7, 0, 0, 10, 5, 10, 9, 0, 7, 0, 0, 0, 0, 0, 0, 10, 8, 0, 10, 9, 8,
+    9, 0, 0, 10, 0, 0, 0, 10, 0, 0, 0, 9, 0, 0, 9, 7, 10, 9, 10, 8, 0, 0, 0, 9, 9, 0, 0, 9, 0, 10,
+    0, 9, 0, 0, 0, 8, 9, 0, 0, 7, 9, 8, 9, 6, 8, 7, 7,
+];
 
 fn decode_known_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
-    if !payload.starts_with(STREAMINGWORLD_LITERAL_HEADER) {
-        return None;
+    for (header, code_lengths) in [
+        (
+            STREAMINGWORLD_LITERAL_HEADER,
+            &STREAMINGWORLD_LITERAL_CODE_LENGTHS,
+        ),
+        (
+            MAINMENU_RLE_COMMAND_HEADER,
+            &MAINMENU_RLE_COMMAND_CODE_LENGTHS,
+        ),
+    ] {
+        if payload.starts_with(header) {
+            return table_from_code_lengths(code_lengths).map(|table| (table, header.len()));
+        }
     }
-    let mut symbols = Vec::with_capacity(206);
-    let mut lengths = Vec::with_capacity(206);
-    for (symbol, &length) in STREAMINGWORLD_LITERAL_CODE_LENGTHS.iter().enumerate() {
+    None
+}
+
+fn table_from_code_lengths(code_lengths: &[u8; 256]) -> Option<OldHuffmanTable> {
+    let mut symbols = Vec::new();
+    let mut lengths = Vec::new();
+    for (symbol, &length) in code_lengths.iter().enumerate() {
         if length != 0 {
             symbols.push(u8::try_from(symbol).ok()?);
             lengths.push(length);
         }
     }
     canonical_huffman_table(&symbols, &lengths)
-        .map(|table| (table, STREAMINGWORLD_LITERAL_HEADER.len()))
 }
 
 fn decode_contiguous_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
@@ -2265,10 +2297,11 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::{
         BLOCK_SIZE, CHUNK_SIZE, COMPRESSED_BLOCK_HEADER, Cursor, KrakenError, LsbWriter,
-        PairedBits, STREAMINGWORLD_LITERAL_HEADER, canonical_huffman_table, decode, decode_array,
-        decode_lz_payload, decode_quantum, decode_rle, decode_scaled_offset_value, encode,
-        encode_array_envelope, encode_contiguous_new_huffman_header, encode_extended_length,
-        encode_greedy_lz_chunk, execute_lz_commands,
+        MAINMENU_RLE_COMMAND_HEADER, PairedBits, STREAMINGWORLD_LITERAL_HEADER,
+        canonical_huffman_table, decode, decode_array, decode_lz_payload, decode_quantum,
+        decode_rle, decode_scaled_offset_value, encode, encode_array_envelope,
+        encode_contiguous_new_huffman_header, encode_extended_length, encode_greedy_lz_chunk,
+        execute_lz_commands,
     };
 
     #[test]
@@ -2648,6 +2681,14 @@ mod tests {
             super::decode_huffman_table(STREAMINGWORLD_LITERAL_HEADER, 21).unwrap();
         assert_eq!(consumed, STREAMINGWORLD_LITERAL_HEADER.len());
         assert_eq!(table.entries.len(), 206);
+    }
+
+    #[test]
+    fn recognizes_stock_mainmenu_rle_command_huffman_table() {
+        let (table, consumed) =
+            super::decode_huffman_table(MAINMENU_RLE_COMMAND_HEADER, 24).unwrap();
+        assert_eq!(consumed, MAINMENU_RLE_COMMAND_HEADER.len());
+        assert_eq!(table.entries.len(), 117);
     }
 
     #[test]
