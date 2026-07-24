@@ -58,6 +58,8 @@ pub enum ArchiveError {
     KrakenRequired,
     #[error("crash-isolated Kraken decompression worker failed")]
     DecompressionWorker,
+    #[error("clean Kraken decoder failed ({clean}); native worker also failed")]
+    KrakenFallbackFailed { clean: kraken::KrakenError },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -682,9 +684,10 @@ pub fn decompress_payload_isolated(
     expected_size: usize,
     kraken_path: &OsStr,
 ) -> Result<Vec<u8>, ArchiveError> {
-    if let Ok(output) = kraken::decode(input, expected_size) {
-        return Ok(output);
-    }
+    let clean_error = match kraken::decode(input, expected_size) {
+        Ok(output) => return Ok(output),
+        Err(error) => error,
+    };
     let executable = std::env::current_exe()?;
     let mut child = Command::new(executable)
         .arg("--kraken")
@@ -711,7 +714,7 @@ pub fn decompress_payload_isolated(
         .write_all(&wire)?;
     let output = child.wait_with_output()?;
     if !output.status.success() || output.stdout.len() != expected_size {
-        return Err(ArchiveError::DecompressionWorker);
+        return Err(ArchiveError::KrakenFallbackFailed { clean: clean_error });
     }
     Ok(output.stdout)
 }

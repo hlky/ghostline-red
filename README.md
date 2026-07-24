@@ -8,7 +8,9 @@ reimplementing WolvenKit's editors.
 The project is currently tested most heavily on Windows. Packing works without
 a DLL and falls back to uncompressed archive segments. The clean-room Kraken
 backend encodes raw blocks, compressed constant blocks, and deterministic
-recent-offset LZ streams for period-8 data. It also emits native-compatible
+recent-offset LZ streams. Its bounded generic matcher supports one explicit
+distance per 128 KiB chunk, distances from 8 through 16,383, scaled-offset
+suffixes, recent-offset reuse, and extended literal/match lengths. It also emits native-compatible
 Huffman chunks for contiguous alphabets of 2–5, 8, or 16 symbols and
 zero-based alphabets of 32, 64, or 128 symbols. Its decoder additionally
 handles
@@ -17,11 +19,14 @@ arrays, RLE byte arrays, simple recursive array composition, and LZ streams
 with recent or explicitly coded legacy distances across both 128 KiB inner
 chunks. Scaled offsets and their low-digit streams are also supported.
 The decoder also supports the fully recovered old-table two-, three-, and
-four-symbol forms of type-2 Huffman arrays, plus contiguous uniform 5-, 8-, and
-16-symbol new-table forms and zero-based uniform 32-, 64-, and 128-symbol
-forms. Both one-partition (type 2) and two-partition (type 4) Huffman framing
-are supported for those tables. Other Huffman tables, tANS, or multi-array
-composition still require a compatible `kraken.dll`, which is not distributed
+four-symbol forms of type-2 Huffman arrays, plus uniform and recovered
+nonuniform five-symbol new tables, contiguous uniform 8- and 16-symbol tables,
+and zero-based uniform 32-, 64-, and 128-symbol forms. Both one-partition
+(type 2) and two-partition (type 4) Huffman framing are supported for those
+tables. Simple recursive arrays and the zero-source multi-array passthrough
+form are supported. General Huffman table descriptions, tANS, and indexed
+multi-array composition remain unsupported by the clean backend; workflows may
+use a compatible `kraken.dll` as an explicit fallback, which is not distributed
 with this repository.
 
 ## Features
