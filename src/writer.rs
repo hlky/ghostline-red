@@ -528,7 +528,9 @@ impl Encoder<'_> {
                         && !std::ptr::eq(existing, data)
                         && existing != data
                     {
-                        return Err(unsupported("conflicting handle data"));
+                        return Err(unsupported(format!(
+                            "conflicting handle data for identity {identity} at export {export_index}"
+                        )));
                     }
                 } else if value.get("HandleRefId").is_none() {
                     return Err(unsupported("handle value"));
@@ -806,10 +808,9 @@ fn collect_handle_ids(value: &Value, identities: &mut HashSet<String>) {
         Value::Object(object) => {
             if let Some(identity) = object.get("HandleId").and_then(Value::as_str) {
                 identities.insert(identity.to_owned());
-            } else {
-                for value in object.values() {
-                    collect_handle_ids(value, identities);
-                }
+            }
+            for value in object.values() {
+                collect_handle_ids(value, identities);
             }
         }
         _ => {}
@@ -1605,16 +1606,48 @@ fn unsupported(message: impl Into<String>) -> WriterError {
 
 #[cfg(test)]
 mod tests {
-    use super::write_with_template;
+    use super::{collect_handle_ids, write_with_template};
     use crate::{codec, schema};
-    use serde_json::Value;
+    use serde_json::{Value, json};
     use std::{
-        collections::{BTreeSet, HashMap},
+        collections::{BTreeSet, HashMap, HashSet},
         env,
         ffi::OsStr,
         fs,
         path::PathBuf,
     };
+
+    #[test]
+    fn collect_handle_ids_includes_nested_definitions() {
+        let value = json!({
+            "HandleId": "phase",
+            "Data": {
+                "$type": "gameJournalQuestPhase",
+                "entries": [{
+                    "HandleId": "objective",
+                    "Data": {
+                        "$type": "gameJournalQuestObjective",
+                        "entries": [{
+                            "HandleId": "mappin",
+                            "Data": {"$type": "gameJournalQuestMapPin"}
+                        }]
+                    }
+                }]
+            }
+        });
+        let mut identities = HashSet::new();
+
+        collect_handle_ids(&value, &mut identities);
+
+        assert_eq!(
+            identities,
+            HashSet::from([
+                "phase".to_owned(),
+                "objective".to_owned(),
+                "mappin".to_owned()
+            ])
+        );
+    }
 
     #[test]
     #[ignore = "real CR2W round-trip test; requires CR2W_FIXTURE and RED_SCHEMA"]
