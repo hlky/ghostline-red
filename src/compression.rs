@@ -308,6 +308,30 @@ mod tests {
             .cycle()
             .take(262_144 + 512)
             .collect();
+        let generic_seed: Vec<u8> = (0..97_u8)
+            .map(|value| value.wrapping_mul(73).wrapping_add(19))
+            .collect();
+        let generic_period: Vec<u8> = generic_seed
+            .iter()
+            .copied()
+            .cycle()
+            .take(262_144 + 512)
+            .collect();
+        let mut generic_state = 0x243f_6a88_u32;
+        let generic_large_seed: Vec<u8> = (0..4_093)
+            .map(|_| {
+                generic_state ^= generic_state << 13;
+                generic_state ^= generic_state >> 17;
+                generic_state ^= generic_state << 5;
+                generic_state.to_le_bytes()[0]
+            })
+            .collect();
+        let generic_large_period: Vec<u8> = generic_large_seed
+            .iter()
+            .copied()
+            .cycle()
+            .take(262_144 + 512)
+            .collect();
         let entropy_cases = [2_u8, 3, 4, 5, 8, 16, 32, 64, 128].map(|alphabet| {
             let mut state = 0x510e_527f_u32 ^ u32::from(alphabet);
             (0..262_144 + 512)
@@ -332,18 +356,29 @@ mod tests {
                     })
                     .collect::<Vec<_>>()
             });
-        for payload in [
+        for (case_index, payload) in [
             block.clone(),
             vec![0x5a; 262_144],
             [block.as_slice(), vec![0xa5; 262_144].as_slice()].concat(),
             period,
+            generic_period,
+            generic_large_period,
         ]
         .into_iter()
         .chain(entropy_cases)
         .chain(sparse_entropy_cases)
+        .enumerate()
         {
             let encoded = crate::kraken::encode(&payload);
-            assert_eq!(kraken.decompress(&encoded, payload.len()).unwrap(), payload);
+            let decoded = kraken.decompress(&encoded, payload.len()).unwrap();
+            let first_difference = decoded
+                .iter()
+                .zip(&payload)
+                .position(|(left, right)| left != right);
+            assert!(
+                decoded == payload,
+                "encoder compatibility case {case_index}, first difference {first_difference:?}"
+            );
         }
     }
 

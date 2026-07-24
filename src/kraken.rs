@@ -54,7 +54,9 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
     {
         return encode_period_eight_stream(input);
     }
-    if let Some(encoded) = encode_huffman_stream(input) {
+    let huffman = encode_huffman_stream(input);
+    let greedy = encode_greedy_lz_stream(input);
+    if let Some(encoded) = [huffman, greedy].into_iter().flatten().min_by_key(Vec::len) {
         return encoded;
     }
     let mut output = Vec::with_capacity(
@@ -75,6 +77,251 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
         }
     }
     output
+}
+
+fn encode_greedy_lz_stream(input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut absolute_offset = 0_usize;
+    for block in input.chunks(BLOCK_SIZE) {
+        let encoded = encode_greedy_lz_block(block, absolute_offset)?;
+        if encoded.len() >= block.len() + RAW_BLOCK_HEADER.len() {
+            return None;
+        }
+        output.extend_from_slice(&encoded);
+        absolute_offset += block.len();
+    }
+    Some(output)
+}
+
+fn encode_greedy_lz_block(block: &[u8], absolute_offset: usize) -> Option<Vec<u8>> {
+    let mut quantum = Vec::new();
+    let mut chunk_offset = 0_usize;
+    for chunk in block.chunks(CHUNK_SIZE) {
+        let has_initial_history = absolute_offset + chunk_offset == 0;
+        if let Some(lz) = encode_single_offset_lz_chunk(chunk, has_initial_history) {
+            write_be24(&mut quantum, 0x88_0000 | u32::try_from(lz.len()).ok()?);
+            quantum.extend_from_slice(&lz);
+        } else {
+            write_be24(&mut quantum, 0x80_0000 | u32::try_from(chunk.len()).ok()?);
+            quantum.extend_from_slice(chunk);
+        }
+        chunk_offset += chunk.len();
+    }
+    if quantum.len() >= block.len() {
+        return None;
+    }
+    let mut output = Vec::with_capacity(quantum.len() + 5);
+    output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+    write_be24(
+        &mut output,
+        u32::try_from(quantum.len().checked_sub(1)?).ok()?,
+    );
+    output.extend_from_slice(&quantum);
+    Some(output)
+}
+
+fn encode_single_offset_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Option<Vec<u8>> {
+    let start = usize::from(has_initial_history) * 8;
+    if chunk.len() < start + 8 {
+        return None;
+    }
+    let search_end = chunk.len();
+    let mut latest = vec![u32::MAX; 1 << 16];
+    let mut selected = None;
+    for position in 0..search_end.saturating_sub(3) {
+        let key = hash_four_bytes(chunk.get(position..position + 4)?);
+        let previous = latest[key];
+        latest[key] = u32::try_from(position).ok()?;
+        if position < start || previous == u32::MAX {
+            continue;
+        }
+        let previous = usize::try_from(previous).ok()?;
+        let distance = position - previous;
+        if (8..=0x3fff).contains(&distance)
+            && common_prefix_length(&chunk[previous..], &chunk[position..], 4) >= 4
+        {
+            selected = Some(distance);
+            break;
+        }
+    }
+    let distance = selected?;
+    let (packed_offset, offset_extra, offset_bits) = encode_scaled_offset(distance)?;
+    let mut literals = Vec::new();
+    let mut commands = Vec::new();
+    let mut packed_lengths = Vec::new();
+    let mut extended_lengths = Vec::new();
+    let mut position = start;
+    let mut literal_start = start;
+    let mut first_match = true;
+    while position + 4 <= chunk.len() {
+        if position < distance {
+            position += 1;
+            continue;
+        }
+        let match_length = common_prefix_length(
+            &chunk[position - distance..],
+            &chunk[position..],
+            chunk.len() - position,
+        );
+        if match_length < 4 {
+            position += 1;
+            continue;
+        }
+        let literal_length = position - literal_start;
+        literals.extend_from_slice(&chunk[literal_start..position]);
+        let literal_code = if literal_length < 3 {
+            u8::try_from(literal_length).ok()?
+        } else if literal_length <= 257 {
+            packed_lengths.push(u8::try_from(literal_length - 3).ok()?);
+            3
+        } else {
+            packed_lengths.push(255);
+            extended_lengths.push(literal_length - 258);
+            3
+        };
+        let match_code = if match_length <= 16 {
+            u8::try_from(match_length - 2).ok()?
+        } else if match_length <= 271 {
+            packed_lengths.push(u8::try_from(match_length - 17).ok()?);
+            15
+        } else {
+            packed_lengths.push(255);
+            extended_lengths.push(match_length - 272);
+            15
+        };
+        let offset_index = if first_match { 3 } else { 0 };
+        commands.push(offset_index << 6 | match_code << 2 | literal_code);
+        first_match = false;
+        position += match_length;
+        literal_start = position;
+    }
+    if commands.is_empty() {
+        return None;
+    }
+    literals.extend_from_slice(&chunk[literal_start..]);
+
+    let mut lz = Vec::new();
+    if has_initial_history {
+        lz.extend_from_slice(&chunk[..8]);
+    }
+    encode_stored_array(&mut lz, &literals);
+    encode_stored_array(&mut lz, &commands);
+    lz.push(128);
+    encode_stored_array(&mut lz, &[packed_offset]);
+    encode_stored_array(&mut lz, &packed_lengths);
+    append_single_offset_suffix(&mut lz, offset_extra, offset_bits, &extended_lengths);
+    (lz.len() < chunk.len()).then_some(lz)
+}
+
+fn hash_four_bytes(bytes: &[u8]) -> usize {
+    let value = u32::from_le_bytes(bytes.try_into().expect("caller supplies four bytes"));
+    usize::from(((value.wrapping_mul(0x9e37_79b1)) >> 16) as u16)
+}
+
+fn common_prefix_length(left: &[u8], right: &[u8], maximum: usize) -> usize {
+    left.iter()
+        .zip(right)
+        .take(maximum)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn encode_scaled_offset(distance: usize) -> Option<(u8, u32, u8)> {
+    if distance < 8 {
+        return None;
+    }
+    let value = u32::try_from(distance.checked_add(8)?).ok()?;
+    let bit_count = value.ilog2().checked_sub(3)?;
+    if bit_count > 26 {
+        return None;
+    }
+    let base = value >> bit_count;
+    if !(8..=15).contains(&base) {
+        return None;
+    }
+    let extra = value & ((1_u32 << bit_count) - 1);
+    let command = u8::try_from((bit_count << 3) | (base - 8)).ok()?;
+    Some((command, extra, u8::try_from(bit_count).ok()?))
+}
+
+fn append_single_offset_suffix(
+    output: &mut Vec<u8>,
+    extra: u32,
+    bit_count: u8,
+    extended_lengths: &[usize],
+) {
+    let mut front = MsbBits::new();
+    front.push_value(extra, u32::from(bit_count));
+    let mut back = MsbBits::new();
+    back.push_gamma(extended_lengths.len() + 1);
+    for (index, &value) in extended_lengths.iter().enumerate() {
+        if index & 1 == 0 {
+            front.push_extended_length(value);
+        } else {
+            back.push_extended_length(value);
+        }
+    }
+    output.extend(front.finish());
+    let mut back = back.finish();
+    back.reverse();
+    output.extend(back);
+}
+
+struct MsbBits {
+    bytes: Vec<u8>,
+    bit_len: usize,
+}
+
+impl MsbBits {
+    const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            bit_len: 0,
+        }
+    }
+
+    fn push_bit(&mut self, bit: bool) {
+        if self.bit_len.is_multiple_of(8) {
+            self.bytes.push(0);
+        }
+        if bit {
+            let byte = self.bytes.last_mut().expect("a byte was just appended");
+            *byte |= 1 << (7 - self.bit_len % 8);
+        }
+        self.bit_len += 1;
+    }
+
+    fn push_value(&mut self, value: u32, count: u32) {
+        for shift in (0..count).rev() {
+            self.push_bit(value >> shift & 1 != 0);
+        }
+    }
+
+    fn push_gamma(&mut self, value: usize) {
+        let bits = value.ilog2();
+        for _ in 0..bits {
+            self.push_bit(false);
+        }
+        self.push_value(u32::try_from(value).unwrap_or(u32::MAX), bits + 1);
+    }
+
+    fn push_extended_length(&mut self, value: usize) {
+        let mut tier = 0_u32;
+        let mut base = 0_usize;
+        while value >= base + (1_usize << (tier + 6)) {
+            base += 1_usize << (tier + 6);
+            tier += 1;
+        }
+        for _ in 0..tier {
+            self.push_bit(false);
+        }
+        self.push_bit(true);
+        self.push_value(u32::try_from(value - base).unwrap_or(u32::MAX), tier + 6);
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
 }
 
 fn encode_huffman_stream(input: &[u8]) -> Option<Vec<u8>> {
@@ -630,6 +877,7 @@ fn decode_lz_payload(
             bits.read_back_extended_length()?
         });
     }
+    bits.require_no_unread_bytes()?;
     let long_lengths = expand_long_lengths(&packed_lengths, &extended, suffix_offset)?;
     execute_lz_commands(
         output,
@@ -1683,6 +1931,22 @@ impl<'a> PairedBits<'a> {
         }
         Ok(())
     }
+
+    fn require_no_unread_bytes(&self) -> Result<(), KrakenError> {
+        let touched = self
+            .front_bits
+            .div_ceil(8)
+            .checked_add(self.back_bits.div_ceil(8))
+            .ok_or(KrakenError::InvalidQuantum {
+                offset: self.stream_offset,
+            })?;
+        if touched < self.bytes.len() || touched > self.bytes.len().saturating_add(1) {
+            return Err(KrakenError::InvalidQuantum {
+                offset: self.stream_offset,
+            });
+        }
+        Ok(())
+    }
 }
 
 fn decode_distance_value(
@@ -1808,10 +2072,11 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BLOCK_SIZE, CHUNK_SIZE, Cursor, KrakenError, LsbWriter, PairedBits,
-        canonical_huffman_table, decode, decode_array, decode_lz_payload, decode_quantum,
-        decode_rle, decode_scaled_offset_value, encode, encode_array_envelope,
-        encode_contiguous_new_huffman_header, encode_extended_length, execute_lz_commands,
+        BLOCK_SIZE, CHUNK_SIZE, COMPRESSED_BLOCK_HEADER, Cursor, KrakenError, LsbWriter,
+        PairedBits, canonical_huffman_table, decode, decode_array, decode_lz_payload,
+        decode_quantum, decode_rle, decode_scaled_offset_value, encode, encode_array_envelope,
+        encode_contiguous_new_huffman_header, encode_extended_length,
+        encode_single_offset_lz_chunk, execute_lz_commands,
     };
 
     #[test]
@@ -1852,6 +2117,51 @@ mod tests {
             assert!(encoded.len() < payload.len(), "encoded size {size}");
             assert_eq!(decode(&encoded, size), Ok(payload));
         }
+    }
+
+    #[test]
+    fn generic_repetitions_use_lz_encoding() {
+        let seed: Vec<u8> = (0..97_u8)
+            .map(|value| value.wrapping_mul(73).wrapping_add(19))
+            .collect();
+        let payload: Vec<u8> = seed.iter().copied().cycle().take(32 * 1024).collect();
+        let encoded = encode(&payload);
+
+        assert_eq!(encoded.get(..2), Some(COMPRESSED_BLOCK_HEADER.as_slice()));
+        assert!(encoded.len() < payload.len() / 8);
+        assert_eq!(decode(&encoded, payload.len()), Ok(payload));
+
+        let mut state = 0x243f_6a88_u32;
+        let large_seed: Vec<u8> = (0..4_093)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state.to_le_bytes()[0]
+            })
+            .collect();
+        let payload: Vec<u8> = large_seed.iter().copied().cycle().take(32 * 1024).collect();
+        let encoded = encode(&payload);
+        assert!(encoded.len() < payload.len() / 2);
+        assert_eq!(decode(&encoded, payload.len()), Ok(payload));
+    }
+
+    #[test]
+    fn rejects_unread_lz_suffix_bytes() {
+        let seed: Vec<u8> = (0..17_u8).map(|value| value.wrapping_mul(31)).collect();
+        let payload: Vec<u8> = seed.iter().copied().cycle().take(1_024).collect();
+        let lz = encode_single_offset_lz_chunk(&payload, true).unwrap();
+        let mut output = Vec::new();
+        assert_eq!(
+            decode_lz_payload(&lz, payload.len(), &mut output, 1, 0),
+            Ok(())
+        );
+        assert_eq!(output, payload);
+
+        let mut malformed = lz;
+        malformed.push(0);
+        let mut output = Vec::new();
+        assert!(decode_lz_payload(&malformed, 1_024, &mut output, 1, 0).is_err());
     }
 
     #[test]
