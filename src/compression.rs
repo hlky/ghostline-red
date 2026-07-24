@@ -320,6 +320,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "clean-room differential test; requires KRAKEN_DLL"]
+    fn clean_room_decodes_native_contiguous_new_huffman_tables() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        for &(alphabet, start) in &[
+            (8_u8, 0_u8),
+            (8, 1),
+            (8, 7),
+            (8, 31),
+            (8, 127),
+            (8, 247),
+            (16, 0),
+            (16, 1),
+            (16, 15),
+            (16, 127),
+            (16, 239),
+        ] {
+            let payload: Vec<u8> = (0..128)
+                .map(|index| start + u8::try_from(index % usize::from(alphabet)).unwrap())
+                .collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            assert_eq!(
+                crate::kraken::decode(&encoded, payload.len()),
+                Ok(payload),
+                "alphabet {alphabet}, start {start}"
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "clean-room whole-match probe; requires KRAKEN_DLL"]
     fn print_oracle_whole_match_quantums() {
         use std::fmt::Write as _;
@@ -787,6 +817,28 @@ mod tests {
                 }
                 println!("alphabet={alphabet} start={start} table={hex}");
             }
+        }
+        let sets = [
+            [0_u8, 1, 2, 3, 4, 5, 6, 8],
+            [0, 1, 2, 3, 4, 5, 7, 8],
+            [0, 1, 2, 3, 4, 6, 7, 8],
+            [0, 1, 2, 3, 5, 6, 7, 8],
+            [0, 1, 2, 4, 5, 6, 7, 8],
+            [0, 1, 3, 4, 5, 6, 7, 8],
+            [0, 2, 3, 4, 5, 6, 7, 8],
+            [1, 2, 3, 4, 5, 6, 7, 8],
+            [0, 8, 16, 24, 32, 40, 48, 56],
+            [0, 32, 64, 96, 128, 160, 192, 224],
+        ];
+        for symbols in sets {
+            let payload: Vec<u8> = symbols.into_iter().cycle().take(128).collect();
+            let encoded = kraken.compress_validated(&payload).unwrap();
+            let table_end = encoded.len() - 50 - 2;
+            let mut hex = String::new();
+            for byte in &encoded[10..table_end] {
+                write!(&mut hex, "{byte:02x}").unwrap();
+            }
+            println!("symbols={symbols:02x?} table={hex}");
         }
     }
 }

@@ -14,9 +14,10 @@ arrays, RLE byte arrays, simple recursive array composition, and LZ streams
 with recent or explicitly coded legacy distances across both 128 KiB inner
 chunks. Scaled offsets and their low-digit streams are also supported.
 The decoder also supports the fully recovered old-table two-, three-, and
-four-symbol forms of type-2 Huffman arrays. Other Huffman tables, tANS, or
-multi-array composition still require a compatible `kraken.dll`, which is not
-distributed with this repository.
+four-symbol forms of type-2 Huffman arrays, plus contiguous uniform 8- and
+16-symbol new-table forms. Other Huffman tables, tANS, or multi-array
+composition still require a compatible `kraken.dll`, which is not distributed
+with this repository.
 
 ## Features
 

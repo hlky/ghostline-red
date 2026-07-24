@@ -595,7 +595,7 @@ fn decode_huffman_one_partition(
     decoded_size: usize,
     offset: usize,
 ) -> Result<Vec<u8>, KrakenError> {
-    let (table, table_size) = decode_old_huffman_table(payload, offset)?;
+    let (table, table_size) = decode_huffman_table(payload, offset)?;
     let split_bytes = payload
         .get(table_size..table_size + 2)
         .ok_or(KrakenError::Truncated {
@@ -699,7 +699,7 @@ impl<'a> HuffBits<'a> {
     }
 }
 
-fn decode_old_huffman_table(
+fn decode_huffman_table(
     payload: &[u8],
     offset: usize,
 ) -> Result<(OldHuffmanTable, usize), KrakenError> {
@@ -772,7 +772,78 @@ fn decode_old_huffman_table(
             }
         }
     }
+    for &(alphabet_size, max_start) in &[(8_u8, 248_u8), (16, 240)] {
+        for start in 0..=max_start {
+            let header = encode_contiguous_new_huffman_header(alphabet_size, start);
+            if payload.starts_with(&header) {
+                let bit_length = u8::try_from(alphabet_size.ilog2()).unwrap();
+                let entries = (0..alphabet_size)
+                    .map(|index| {
+                        (
+                            reverse_low_bits(u16::from(index), bit_length),
+                            bit_length,
+                            start + index,
+                        )
+                    })
+                    .collect();
+                return Ok((OldHuffmanTable { entries }, header.len()));
+            }
+        }
+    }
     Err(KrakenError::UnsupportedQuantum { offset })
+}
+
+fn reverse_low_bits(mut value: u16, bit_count: u8) -> u16 {
+    let mut reversed = 0_u16;
+    for _ in 0..bit_count {
+        reversed = reversed << 1 | (value & 1);
+        value >>= 1;
+    }
+    reversed
+}
+
+fn encode_contiguous_new_huffman_header(alphabet_size: u8, start: u8) -> Vec<u8> {
+    match (alphabet_size, start) {
+        (8, 0) => vec![0x90, 0x70, 0x08, 0x95, 0xff, 0xe0],
+        (16, 0) => vec![0x80, 0xf0, 0x00, 0x82, 0x22, 0xab, 0xfe],
+        (8, _) => {
+            let mut output = vec![0x90, 0x71, 0x08, 0x95];
+            append_new_huffman_start_code(&mut output, start, 3, 9);
+            output
+        }
+        (16, _) => {
+            let mut output = vec![0x80, 0xf0, 0x80, 0x82, 0x22, 0xab];
+            append_new_huffman_start_code(&mut output, start, 7, 1);
+            output
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn append_new_huffman_start_code(
+    output: &mut Vec<u8>,
+    start: u8,
+    leading_ones: usize,
+    delimiter_ones: usize,
+) {
+    debug_assert!(start > 0);
+    let tier = usize::try_from((u16::from(start) + 1).ilog2()).unwrap();
+    let base = (1_usize << tier) - 1;
+    let delta = usize::from(start) - base;
+    let mut bits = Vec::with_capacity(leading_ones + tier + delimiter_ones + tier);
+    bits.extend(std::iter::repeat_n(true, leading_ones));
+    bits.extend(std::iter::repeat_n(false, tier - 1));
+    bits.extend(std::iter::repeat_n(true, delimiter_ones));
+    for shift in (0..tier).rev() {
+        bits.push(delta >> shift & 1 != 0);
+    }
+    let byte_count = bits.len().div_ceil(8);
+    bits.resize(byte_count * 8, false);
+    output.extend(bits.chunks_exact(8).map(|byte_bits| {
+        byte_bits
+            .iter()
+            .fold(0_u8, |byte, &bit| byte << 1 | u8::from(bit))
+    }));
 }
 
 fn require_array_size(
@@ -1409,7 +1480,7 @@ mod tests {
     use super::{
         BLOCK_SIZE, CHUNK_SIZE, Cursor, KrakenError, PairedBits, decode, decode_array,
         decode_lz_payload, decode_quantum, decode_scaled_offset_value, encode,
-        encode_extended_length, execute_lz_commands,
+        encode_contiguous_new_huffman_header, encode_extended_length, execute_lz_commands,
     };
 
     #[test]
@@ -1575,6 +1646,58 @@ mod tests {
         let mut cursor = Cursor::new(&quad, 0);
         assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected_quad));
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn decodes_contiguous_new_table_eight_symbol_huffman_array() {
+        let bytes = [
+            0x20, 0x01, 0xfc, 0x00, 0x3a, // type 2: 58 -> 128
+            0x90, 0x70, 0x08, 0x95, 0xff, 0xe0, // new eight-symbol table
+            0x11, 0x00, // first forward stream is seventeen bytes
+            0xb9, 0x83, 0xc4, 0x2b, 0xb7, 0x3d, 0x80, 0x75, 0x94, 0xd1, 0x08, 0xe1, 0xe2, 0x60,
+            0x7d, 0xdd, 0x00, 0x61, 0xac, 0x8a, 0x36, 0xe8, 0x67, 0xee, 0x03, 0x9e, 0x59, 0x75,
+            0x46, 0x2c, 0xdb, 0xf6, 0x28, 0x00, 0xb2, 0xc5, 0xf5, 0x52, 0x74, 0xed, 0xd4, 0x60,
+            0x3b, 0x82, 0x93, 0xce, 0x6e, 0xe1, 0x90, 0x3e,
+        ];
+        let mut expected: Vec<u8> = (0..128_usize)
+            .map(|index| u8::try_from(index % 8).unwrap())
+            .collect();
+        deterministic_shuffle(&mut expected, 0x299f_31d0);
+        let mut cursor = Cursor::new(&bytes, 0);
+        assert_eq!(decode_array(&mut cursor, Some(128), 0), Ok(expected));
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn reproduces_contiguous_new_table_headers() {
+        for (alphabet, start, expected) in [
+            (8, 0, "90700895ffe0"),
+            (8, 1, "90710895fff0"),
+            (8, 7, "90710895e7fc00"),
+            (8, 127, "90710895e07fc000"),
+            (8, 247, "90710895e07ffc00"),
+            (16, 0, "80f0008222abfe"),
+            (16, 1, "80f0808222abff00"),
+            (16, 15, "80f0808222abfe20"),
+            (16, 127, "80f0808222abfe0400"),
+            (16, 239, "80f0808222abfe0780"),
+        ] {
+            assert_eq!(
+                encode_contiguous_new_huffman_header(alphabet, start),
+                decode_hex(expected)
+            );
+        }
+    }
+
+    fn decode_hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).unwrap();
+                u8::from_str_radix(pair, 16).unwrap()
+            })
+            .collect()
     }
 
     fn deterministic_shuffle(values: &mut [u8], mut state: u32) {
