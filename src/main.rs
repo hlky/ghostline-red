@@ -45,6 +45,9 @@ enum Command {
         archive: PathBuf,
         #[arg(short, long)]
         output: PathBuf,
+        /// Extract only this exact depot path (`WolvenKit` `-w` equivalent).
+        #[arg(short = 'w', long)]
+        path: Option<String>,
         /// Resolve native hashes from files beneath this depot root.
         #[arg(long)]
         paths_root: Option<PathBuf>,
@@ -153,15 +156,20 @@ fn main() -> Result<()> {
         Command::Extract {
             archive: path,
             output,
+            path: depot_path,
             paths_root,
         } => {
             fs::create_dir_all(&output)?;
-            archive::extract(
-                &path,
-                &output,
-                cli.kraken.as_os_str(),
-                paths_root.as_deref(),
-            )?;
+            if let Some(depot_path) = depot_path {
+                archive::extract_path(&path, &output, &depot_path, cli.kraken.as_os_str())?;
+            } else {
+                archive::extract(
+                    &path,
+                    &output,
+                    cli.kraken.as_os_str(),
+                    paths_root.as_deref(),
+                )?;
+            }
         }
         Command::ArchiveList {
             archive: path,

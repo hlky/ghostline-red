@@ -46,6 +46,8 @@ pub enum ArchiveError {
     Compression(#[from] CompressionError),
     #[error("archive entry {hash:016x} has no resolvable depot path")]
     UnresolvedPath { hash: u64 },
+    #[error("archive contains no entry for depot-path hash {hash:016x}")]
+    EntryNotFound { hash: u64 },
     #[error("invalid path beneath archive root: {0}")]
     InvalidDepotPath(PathBuf),
     #[error("duplicate depot-path hash {hash:016x}")]
@@ -417,6 +419,58 @@ pub fn extract(
         }
         target_file.flush()?;
     }
+    Ok(())
+}
+
+/// Extracts one archive entry selected by its exact depot path.
+///
+/// This mirrors `WolvenKit`'s scoped `extract -w <depot-path>` workflow and
+/// does not require an embedded or external path database.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] when the path is unsafe, its hash is absent, the
+/// entry references malformed segments, decompression fails, or output I/O
+/// fails.
+pub fn extract_path(
+    archive_path: &Path,
+    output: &Path,
+    depot_path: &str,
+    kraken_path: &OsStr,
+) -> Result<(), ArchiveError> {
+    let index = read_archive(archive_path)?;
+    let name_hash = depot_path_hash(depot_path);
+    let (entry_index, entry) = index
+        .entries
+        .iter()
+        .enumerate()
+        .find(|(_, entry)| entry.name_hash == name_hash)
+        .ok_or(ArchiveError::EntryNotFound { hash: name_hash })?;
+    let target = output.join(safe_depot_path(depot_path)?);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut archive = BufReader::new(File::open(archive_path)?);
+    let mut target_file = BufWriter::new(File::create(target)?);
+    let start = usize::try_from(entry.segments_start).map_err(|_| ArchiveError::CountOverflow)?;
+    let end = usize::try_from(entry.segments_end).map_err(|_| ArchiveError::CountOverflow)?;
+    let selected = index
+        .segments
+        .get(start..end)
+        .ok_or(ArchiveError::InvalidSegmentRange {
+            entry: entry_index,
+            start: entry.segments_start,
+            end: entry.segments_end,
+        })?;
+    for (segment_index, segment) in selected.iter().enumerate() {
+        target_file.write_all(&read_segment(
+            &mut archive,
+            *segment,
+            kraken_path,
+            segment_index == 0,
+        )?)?;
+    }
+    target_file.flush()?;
     Ok(())
 }
 
@@ -806,7 +860,10 @@ fn read_custom_paths(path: &Path, length: u32) -> Result<Vec<String>, ArchiveErr
     reader.seek(SeekFrom::Start(
         u64::try_from(EXTENDED_HEADER_SIZE).map_err(|_| ArchiveError::CountOverflow)?,
     ))?;
-    if reader.read_u32_le()? != LXRS_MAGIC || reader.read_u32_le()? != 1 {
+    if reader.read_u32_le()? != LXRS_MAGIC {
+        return Ok(Vec::new());
+    }
+    if reader.read_u32_le()? != 1 {
         return Err(ArchiveError::InvalidIndex);
     }
     let size = reader.read_u32_le()?;
@@ -843,7 +900,10 @@ fn read_compressed_custom_paths(
     reader.seek(SeekFrom::Start(
         u64::try_from(EXTENDED_HEADER_SIZE).map_err(|_| ArchiveError::CountOverflow)?,
     ))?;
-    if reader.read_u32_le()? != LXRS_MAGIC || reader.read_u32_le()? != 1 {
+    if reader.read_u32_le()? != LXRS_MAGIC {
+        return Ok(Vec::new());
+    }
+    if reader.read_u32_le()? != 1 {
         return Err(ArchiveError::InvalidIndex);
     }
     let size = reader.read_u32_le()?;
@@ -1060,6 +1120,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::io::{Cursor, Write};
 
     #[test]
@@ -1081,5 +1142,16 @@ mod tests {
         let windows = depot_path_hash(r"mod\ghostline\test.ent");
         let portable = depot_path_hash("/MOD/Ghostline//test.ent/");
         assert_eq!(windows, portable);
+    }
+
+    #[test]
+    fn absent_lxrs_metadata_should_return_no_custom_paths() {
+        let mut path = tempfile::NamedTempFile::new().unwrap();
+        path.write_all(&[0_u8; EXTENDED_HEADER_SIZE + 8]).unwrap();
+
+        let paths =
+            read_compressed_custom_paths(path.path(), OsStr::new("missing-kraken.dll")).unwrap();
+
+        assert!(paths.is_empty());
     }
 }

@@ -101,6 +101,19 @@ Extract an archive:
   -o '.\build\extracted'
 ```
 
+Extract one exact depot path from a stock or mod archive (equivalent to
+`WolvenKit.CLI extract ... -w <path>`):
+
+```powershell
+& $red extract `
+  'H:\Cyberpunk 2077\archive\pc\content\basegame_3_nightcity.archive' `
+  -o '.\extracted' `
+  -w 'base\worlds\03_night_city\_compiled\default\03_night_city.streamingworld'
+```
+
+Scoped extraction hashes the supplied path directly, so it does not need an
+embedded LXRS path table or `--paths-root`.
+
 List its index:
 
 ```powershell
