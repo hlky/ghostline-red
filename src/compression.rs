@@ -308,12 +308,26 @@ mod tests {
             .cycle()
             .take(262_144 + 512)
             .collect();
+        let entropy_cases = [2_u8, 3, 4, 5, 8, 16].map(|alphabet| {
+            let mut state = 0x510e_527f_u32 ^ u32::from(alphabet);
+            (0..262_144 + 512)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    100 + state.to_le_bytes()[0] % alphabet
+                })
+                .collect::<Vec<_>>()
+        });
         for payload in [
             block.clone(),
             vec![0x5a; 262_144],
             [block.as_slice(), vec![0xa5; 262_144].as_slice()].concat(),
             period,
-        ] {
+        ]
+        .into_iter()
+        .chain(entropy_cases)
+        {
             let encoded = crate::kraken::encode(&payload);
             assert_eq!(kraken.decompress(&encoded, payload.len()).unwrap(), payload);
         }

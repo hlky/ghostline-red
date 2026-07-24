@@ -8,7 +8,9 @@ reimplementing WolvenKit's editors.
 The project is currently tested most heavily on Windows. Packing works without
 a DLL and falls back to uncompressed archive segments. The clean-room Kraken
 backend encodes raw blocks, compressed constant blocks, and deterministic
-recent-offset LZ streams for period-8 data. Its decoder additionally handles
+recent-offset LZ streams for period-8 data. It also emits native-compatible
+Huffman chunks for contiguous alphabets of 2–5, 8, or 16 symbols. Its decoder
+additionally handles
 stored inner chunks, stored byte
 arrays, RLE byte arrays, simple recursive array composition, and LZ streams
 with recent or explicitly coded legacy distances across both 128 KiB inner

@@ -1,9 +1,9 @@
 //! Implements the DLL-free subset of the Oodle Kraken byte stream.
 //!
 //! Streams are divided into independent 256 KiB blocks. This module emits
-//! standards-compatible raw blocks and compact constant-byte blocks. The
-//! decoder accepts those block forms plus stored compressed-block quantums and
-//! rejects entropy-coded quantums until their bounded decoder is implemented.
+//! standards-compatible raw, constant-byte, low-cardinality Huffman, and
+//! deterministic recent-offset LZ blocks. The decoder additionally accepts
+//! stored, RLE, recursive, and the implemented Huffman array forms.
 
 use thiserror::Error;
 
@@ -39,8 +39,9 @@ pub enum KrakenError {
 
 /// Encodes bytes as a compatible Kraken stream without proprietary code.
 ///
-/// Constant blocks use Kraken's compact memset quantum. Other blocks are
-/// emitted verbatim using the format's uncompressed block representation.
+/// Constant blocks use Kraken's compact memset quantum. Low-cardinality blocks
+/// use deterministic Huffman arrays, period-eight data uses a compact LZ
+/// representation, and other blocks use the uncompressed representation.
 #[must_use]
 pub fn encode(input: &[u8]) -> Vec<u8> {
     if input.len() >= 288
@@ -52,6 +53,9 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
         && input.windows(2).any(|pair| pair[0] != pair[1])
     {
         return encode_period_eight_stream(input);
+    }
+    if let Some(encoded) = encode_huffman_stream(input) {
+        return encoded;
     }
     let mut output = Vec::with_capacity(
         input
@@ -68,6 +72,150 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
         } else {
             output.extend_from_slice(&RAW_BLOCK_HEADER);
             output.extend_from_slice(block);
+        }
+    }
+    output
+}
+
+fn encode_huffman_stream(input: &[u8]) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    for block in input.chunks(BLOCK_SIZE) {
+        if let Some(&value) = block.first()
+            && block.iter().all(|byte| *byte == value)
+        {
+            output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+            output.extend_from_slice(&MEMSET_QUANTUM);
+            output.push(value);
+            continue;
+        }
+        let encoded = encode_huffman_block(block)?;
+        if encoded.len() >= block.len() + RAW_BLOCK_HEADER.len() {
+            return None;
+        }
+        output.extend_from_slice(&encoded);
+    }
+    Some(output)
+}
+
+fn encode_huffman_block(block: &[u8]) -> Option<Vec<u8>> {
+    let mut quantum = Vec::new();
+    for chunk in block.chunks(CHUNK_SIZE) {
+        quantum.extend_from_slice(&encode_huffman_array(chunk)?);
+    }
+    if quantum.is_empty() || quantum.len() >= block.len() || quantum.len() > 0x3_ffff {
+        return None;
+    }
+    let mut output = Vec::with_capacity(quantum.len() + 5);
+    output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+    write_be24(&mut output, u32::try_from(quantum.len() - 1).ok()?);
+    output.extend_from_slice(&quantum);
+    Some(output)
+}
+
+fn encode_huffman_array(input: &[u8]) -> Option<Vec<u8>> {
+    let (&minimum, &maximum) = (input.iter().min()?, input.iter().max()?);
+    let span = usize::from(maximum) - usize::from(minimum) + 1;
+    let alphabet_size = [2_u8, 3, 4, 5, 8, 16]
+        .into_iter()
+        .find(|&size| span <= usize::from(size))?;
+    let start = minimum.min(u8::MAX - alphabet_size + 1);
+    if usize::from(maximum) >= usize::from(start) + usize::from(alphabet_size) {
+        return None;
+    }
+    let table = encode_huffman_table(alphabet_size, start)?;
+    let mut first_bits = Vec::new();
+    let mut second_bits = Vec::new();
+    let mut backward_bits = Vec::new();
+    for (index, &symbol) in input.iter().enumerate() {
+        let symbol_index = symbol - start;
+        let (code, bit_count) = huffman_encoder_code(alphabet_size, symbol_index)?;
+        match index % 3 {
+            0 => append_lsb_code(&mut first_bits, code, bit_count),
+            1 => append_lsb_code(&mut backward_bits, code, bit_count),
+            _ => append_lsb_code(&mut second_bits, code, bit_count),
+        }
+    }
+    let first = pack_lsb_bits(&first_bits);
+    let second = pack_lsb_bits(&second_bits);
+    let mut backward = pack_lsb_bits(&backward_bits);
+    backward.reverse();
+    let mut payload =
+        Vec::with_capacity(table.len() + 2 + first.len() + second.len() + backward.len());
+    payload.extend_from_slice(&table);
+    payload.extend_from_slice(&u16::try_from(first.len()).ok()?.to_le_bytes());
+    payload.extend_from_slice(&first);
+    payload.extend_from_slice(&second);
+    payload.extend_from_slice(&backward);
+    if payload.len() >= input.len() || payload.len() > 0x3_ffff || input.len() > 0x3_ffff {
+        return None;
+    }
+    let decoded_minus_one = u32::try_from(input.len().checked_sub(1)?).ok()?;
+    let compressed = u32::try_from(payload.len()).ok()?;
+    let mut output = Vec::with_capacity(payload.len() + 5);
+    output.push(0x20 | u8::try_from(decoded_minus_one >> 14).ok()?);
+    output.extend_from_slice(&((decoded_minus_one & 0x3fff) << 18 | compressed).to_be_bytes());
+    output.extend_from_slice(&payload);
+    Some(output)
+}
+
+fn huffman_encoder_code(alphabet_size: u8, symbol_index: u8) -> Option<(u16, u8)> {
+    match alphabet_size {
+        2 => [(0, 1), (1, 1)].get(usize::from(symbol_index)).copied(),
+        3 => [(0b01, 2), (0, 1), (0b11, 2)]
+            .get(usize::from(symbol_index))
+            .copied(),
+        4 => [(0b00, 2), (0b10, 2), (0b01, 2), (0b11, 2)]
+            .get(usize::from(symbol_index))
+            .copied(),
+        5 => [(0b00, 2), (0b10, 2), (0b01, 2), (0b011, 3), (0b111, 3)]
+            .get(usize::from(symbol_index))
+            .copied(),
+        8 | 16 if symbol_index < alphabet_size => {
+            let bits = u8::try_from(alphabet_size.ilog2()).ok()?;
+            Some((reverse_low_bits(u16::from(symbol_index), bits), bits))
+        }
+        _ => None,
+    }
+}
+
+fn encode_huffman_table(alphabet_size: u8, start: u8) -> Option<Vec<u8>> {
+    let last = start.checked_add(alphabet_size - 1)?;
+    match alphabet_size {
+        2 => {
+            let value = 0x0080_0000 | u32::from(start) << 11 | u32::from(last) << 3;
+            Some(value.to_be_bytes().to_vec())
+        }
+        3 => {
+            let value = 0x0000_c804_0001_u64
+                | u64::from(start) << 19
+                | u64::from(start + 1) << 10
+                | u64::from(last) << 1;
+            Some(value.to_be_bytes()[3..].to_vec())
+        }
+        4 => {
+            let value = 0x01_0804_0201_0080_u64
+                | u64::from(start) << 35
+                | u64::from(start + 1) << 26
+                | u64::from(start + 2) << 17
+                | u64::from(last) << 8;
+            Some(value.to_be_bytes()[1..].to_vec())
+        }
+        5 | 8 | 16 => Some(encode_contiguous_new_huffman_header(alphabet_size, start)),
+        _ => None,
+    }
+}
+
+fn append_lsb_code(bits: &mut Vec<bool>, code: u16, bit_count: u8) {
+    for shift in 0..bit_count {
+        bits.push(code >> shift & 1 != 0);
+    }
+}
+
+fn pack_lsb_bits(bits: &[bool]) -> Vec<u8> {
+    let mut output = vec![0_u8; bits.len().div_ceil(8)];
+    for (index, &bit) in bits.iter().enumerate() {
+        if bit {
+            output[index / 8] |= 1 << (index & 7);
         }
     }
     output
@@ -1591,6 +1739,30 @@ mod tests {
             let encoded = encode(&payload);
             assert!(encoded.len() < payload.len(), "encoded size {size}");
             assert_eq!(decode(&encoded, size), Ok(payload));
+        }
+    }
+
+    #[test]
+    fn contiguous_alphabets_use_huffman_encoding() {
+        for &alphabet in &[2_u8, 3, 4, 5, 8, 16] {
+            for size in [128_usize, CHUNK_SIZE, BLOCK_SIZE + 1_024] {
+                let mut state = 0x510e_527f_u32 ^ u32::from(alphabet);
+                let payload: Vec<u8> = (0..size)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 17;
+                        state ^= state << 5;
+                        100 + state.to_le_bytes()[0] % alphabet
+                    })
+                    .collect();
+                let encoded = encode(&payload);
+                assert!(encoded.len() < payload.len(), "alphabet {alphabet}, {size}");
+                assert_eq!(
+                    decode(&encoded, payload.len()),
+                    Ok(payload),
+                    "alphabet {alphabet}, {size}"
+                );
+            }
         }
     }
 
