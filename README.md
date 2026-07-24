@@ -28,7 +28,10 @@ tables. Simple recursive arrays and the zero-source multi-array passthrough
 form are supported. General Huffman table descriptions, tANS, and indexed
 multi-array composition remain unsupported by the clean backend; workflows may
 use a compatible `kraken.dll` as an explicit fallback, which is not distributed
-with this repository.
+with this repository. A recovered 206-symbol shipping table used by
+`03_night_city.streamingworld` is also recognized, allowing that real-world
+scoped extract and CR2W serialization workflow to run without a DLL while the
+general table parser is completed.
 
 ## Preliminary performance
 

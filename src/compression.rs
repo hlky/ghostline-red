@@ -1128,4 +1128,17 @@ mod tests {
             &recompressed[..recompressed.len().min(96)]
         );
     }
+
+    #[test]
+    #[ignore = "clean-room real-corpus differential test; requires KRAKEN_DLL and KRAKEN_FIXTURE"]
+    fn clean_room_decodes_real_kraken_fixture() {
+        let path = env::var_os("KRAKEN_DLL").map(PathBuf::from).unwrap();
+        let fixture = env::var_os("KRAKEN_FIXTURE").map(PathBuf::from).unwrap();
+        let decoded_size: usize = env::var("KRAKEN_FIXTURE_SIZE").unwrap().parse().unwrap();
+        let encoded = std::fs::read(fixture).unwrap();
+        let kraken = Kraken::load(path.as_os_str()).unwrap();
+        let native = kraken.decompress(&encoded, decoded_size).unwrap();
+
+        assert_eq!(crate::kraken::decode(&encoded, decoded_size), Ok(native));
+    }
 }

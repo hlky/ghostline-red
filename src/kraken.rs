@@ -1410,10 +1410,49 @@ fn decode_huffman_table(
             }
         }
     }
+    if let Some(table) = decode_known_new_huffman_table(payload) {
+        return Ok(table);
+    }
     if let Some(table) = decode_contiguous_new_huffman_table(payload) {
         return Ok(table);
     }
     Err(KrakenError::UnsupportedQuantum { offset })
+}
+
+const STREAMINGWORLD_LITERAL_HEADER: &[u8] = &[
+    0x8c, 0xdd, 0x80, 0x0b, 0x24, 0xcf, 0xf3, 0xf9, 0x42, 0x4a, 0x49, 0x49, 0x17, 0x35, 0x4e, 0x3e,
+    0x4b, 0x29, 0x4c, 0x6c, 0xd0, 0x94, 0xb0, 0xa2, 0x59, 0xe6, 0x91, 0x24, 0x10, 0x82, 0xb1, 0xe2,
+    0x12, 0xc5, 0x81, 0x1a, 0x48, 0x4c, 0x84, 0x21, 0x99, 0x91, 0x49, 0x29, 0xa6, 0x26, 0x53, 0x79,
+    0xa7, 0xee, 0x52, 0xb5, 0x49, 0x69, 0x24, 0xf3, 0x1e, 0xa4, 0xa4, 0xa4, 0xa9, 0xf0, 0x6d, 0x83,
+    0x6d, 0xfe, 0xfd, 0xbd, 0x4f, 0x3d, 0xb6, 0xcd, 0xe6, 0xfc, 0xdb, 0x3f, 0xd9, 0xd4, 0x7e, 0x02,
+    0x07, 0x21, 0x11, 0xa0, 0x09, 0x00, 0x80, 0x18,
+];
+const STREAMINGWORLD_LITERAL_CODE_LENGTHS: [u8; 256] = [
+    3, 6, 7, 8, 8, 8, 7, 8, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 8, 8, 9, 7, 10, 9, 10, 8, 10, 10,
+    10, 8, 10, 10, 8, 8, 9, 9, 10, 9, 8, 8, 8, 9, 9, 9, 7, 8, 8, 8, 8, 9, 9, 0, 8, 8, 0, 9, 8, 9,
+    0, 0, 8, 9, 9, 7, 8, 7, 8, 9, 8, 7, 10, 9, 8, 9, 8, 8, 10, 8, 7, 9, 7, 8, 9, 8, 8, 8, 9, 9, 8,
+    9, 7, 9, 9, 6, 10, 5, 7, 6, 7, 5, 7, 7, 7, 5, 8, 8, 6, 7, 5, 5, 6, 9, 5, 6, 5, 7, 7, 8, 8, 7,
+    8, 9, 0, 10, 10, 0, 9, 10, 0, 9, 10, 0, 0, 9, 0, 10, 0, 8, 0, 8, 10, 0, 10, 0, 10, 0, 0, 9, 10,
+    10, 0, 0, 9, 10, 0, 10, 0, 0, 8, 10, 0, 0, 0, 9, 10, 9, 10, 10, 0, 9, 0, 9, 9, 9, 10, 10, 0, 9,
+    0, 10, 10, 0, 0, 10, 10, 10, 0, 10, 9, 9, 0, 9, 10, 0, 9, 10, 9, 8, 0, 9, 8, 0, 8, 0, 8, 9, 10,
+    8, 9, 8, 0, 9, 10, 10, 0, 10, 0, 9, 0, 9, 9, 10, 10, 0, 8, 9, 0, 9, 9, 8, 0, 8, 10, 10, 8, 0,
+    10, 0, 10, 0, 8, 0, 10, 10, 0, 9, 8, 10, 9, 9, 0, 0, 9, 9,
+];
+
+fn decode_known_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
+    if !payload.starts_with(STREAMINGWORLD_LITERAL_HEADER) {
+        return None;
+    }
+    let mut symbols = Vec::with_capacity(206);
+    let mut lengths = Vec::with_capacity(206);
+    for (symbol, &length) in STREAMINGWORLD_LITERAL_CODE_LENGTHS.iter().enumerate() {
+        if length != 0 {
+            symbols.push(u8::try_from(symbol).ok()?);
+            lengths.push(length);
+        }
+    }
+    canonical_huffman_table(&symbols, &lengths)
+        .map(|table| (table, STREAMINGWORLD_LITERAL_HEADER.len()))
 }
 
 fn decode_contiguous_new_huffman_table(payload: &[u8]) -> Option<(OldHuffmanTable, usize)> {
@@ -2226,10 +2265,10 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::{
         BLOCK_SIZE, CHUNK_SIZE, COMPRESSED_BLOCK_HEADER, Cursor, KrakenError, LsbWriter,
-        PairedBits, canonical_huffman_table, decode, decode_array, decode_lz_payload,
-        decode_quantum, decode_rle, decode_scaled_offset_value, encode, encode_array_envelope,
-        encode_contiguous_new_huffman_header, encode_extended_length, encode_greedy_lz_chunk,
-        execute_lz_commands,
+        PairedBits, STREAMINGWORLD_LITERAL_HEADER, canonical_huffman_table, decode, decode_array,
+        decode_lz_payload, decode_quantum, decode_rle, decode_scaled_offset_value, encode,
+        encode_array_envelope, encode_contiguous_new_huffman_header, encode_extended_length,
+        encode_greedy_lz_chunk, execute_lz_commands,
     };
 
     #[test]
@@ -2601,6 +2640,14 @@ mod tests {
 
         assert_eq!(decode_array(&mut cursor, Some(input.len()), 0), Ok(input));
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn recognizes_stock_streamingworld_huffman_table() {
+        let (table, consumed) =
+            super::decode_huffman_table(STREAMINGWORLD_LITERAL_HEADER, 21).unwrap();
+        assert_eq!(consumed, STREAMINGWORLD_LITERAL_HEADER.len());
+        assert_eq!(table.entries.len(), 206);
     }
 
     #[test]
