@@ -85,6 +85,7 @@ struct Encoder<'a> {
     imports: RefCell<HashMap<String, u16>>,
     new_imports: RefCell<Vec<NewImport>>,
     handle_exports: RefCell<HashMap<String, usize>>,
+    claimed_exports: RefCell<HashSet<usize>>,
     candidate_handles: RefCell<HashSet<String>>,
     discovering_handles: Cell<bool>,
     classes: &'a BTreeSet<String>,
@@ -177,6 +178,7 @@ pub fn write_with_template(
         ),
         new_imports: RefCell::new(Vec::new()),
         handle_exports: RefCell::new(HashMap::new()),
+        claimed_exports: RefCell::new(HashSet::new()),
         candidate_handles: RefCell::new(HashSet::new()),
         discovering_handles: Cell::new(true),
         classes,
@@ -193,8 +195,12 @@ pub fn write_with_template(
         let size = usize::try_from(export.data_size).map_err(|_| WriterError::TooLarge)?;
         let _ = encoder.encode_class(value, start, size, class_name, &mut chunks)?;
     }
-    encoder.discovering_handles.set(false);
-    let new_exports = collect_new_exports(&document, &file, &encoder.candidate_handles)?;
+    let new_exports = collect_new_exports(
+        &document,
+        &file,
+        &encoder.candidate_handles,
+        &encoder.handle_exports,
+    )?;
     for (offset, export) in new_exports.iter().enumerate() {
         let export_index = file.exports.len() + offset;
         chunks.insert(export_index, export.value);
@@ -203,7 +209,12 @@ pub fn write_with_template(
             .borrow_mut()
             .insert(export.handle_id.clone(), export_index);
         let _ = encoder.name_index(&export.class_name)?;
+        let template = &file.exports[export.template_index];
+        let start = usize::try_from(template.data_offset).map_err(|_| WriterError::TooLarge)?;
+        let size = usize::try_from(template.data_size).map_err(|_| WriterError::TooLarge)?;
+        let _ = encoder.encode_class(export.value, start, size, &export.class_name, &mut chunks)?;
     }
+    encoder.discovering_handles.set(false);
 
     let new_names = encoder.new_names.borrow().clone();
     let mut name_values: Vec<String> = file.names.iter().map(|name| name.value.clone()).collect();
@@ -367,12 +378,18 @@ impl Encoder<'_> {
             output.extend_from_slice(&payload);
             cursor = payload_end;
         }
+        if red_type == "worldStreamingSector" {
+            output.extend_from_slice(&self.encode_streaming_sector_appendix(
+                object,
+                cursor,
+                template_end,
+                chunks,
+            )?);
+            return Ok((output, template_end));
+        }
         if matches!(
             red_type,
-            "worldStreamingSector"
-                | "worldStreamingWorld"
-                | "gameDeviceResourceData"
-                | "CMaterialInstance"
+            "worldStreamingWorld" | "gameDeviceResourceData" | "CMaterialInstance"
         ) {
             // Typed reverse appendix codecs are connected separately; until
             // then the audited template bytes remain authoritative.
@@ -380,6 +397,144 @@ impl Encoder<'_> {
             return Ok((output, template_end));
         }
         Ok((output, cursor))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the appendix fields are encoded in their fixed binary order"
+    )]
+    fn encode_streaming_sector_appendix<'v>(
+        &self,
+        object: &'v serde_json::Map<String, Value>,
+        start: usize,
+        end: usize,
+        chunks: &mut HashMap<usize, &'v Value>,
+    ) -> Result<Vec<u8>, WriterError> {
+        let mut template_cursor = start
+            .checked_add(12)
+            .filter(|cursor| *cursor <= end)
+            .ok_or_else(|| unsupported("streaming sector appendix bounds"))?;
+        let (template_node_count, next) = self.vlq(template_cursor)?;
+        template_cursor = next;
+        let template_node_start = template_cursor;
+        let _template_nodes_end = template_cursor
+            .checked_add(template_node_count * 4)
+            .filter(|cursor| *cursor <= end)
+            .ok_or_else(|| unsupported("streaming sector node bounds"))?;
+
+        let nodes = object
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported("worldStreamingSector.nodes"))?;
+        if self.discovering_handles.get() {
+            for (index, value) in nodes.iter().enumerate() {
+                if index < template_node_count {
+                    let pointer = template_node_start + index * 4;
+                    let _ = self.encode_value(value, "handle:worldNode", pointer, 4, chunks)?;
+                } else {
+                    collect_handle_ids(value, &mut self.candidate_handles.borrow_mut());
+                }
+            }
+            return self
+                .template
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| unsupported("streaming sector appendix bounds"));
+        }
+
+        for property in ["persistentNodes", "variantNodes"] {
+            if object
+                .get(property)
+                .and_then(Value::as_array)
+                .is_some_and(|values| !values.is_empty())
+            {
+                return Err(unsupported(format!(
+                    "worldStreamingSector.{property} is non-empty"
+                )));
+            }
+        }
+
+        let version = object
+            .get("version")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| unsupported("worldStreamingSector.version"))?;
+        let buffer_index = object
+            .get("nodeData")
+            .and_then(|value| value.get("BufferId"))
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| unsupported("worldStreamingSector.nodeData BufferId"))?;
+        let buffer_pointer = buffer_index
+            .checked_add(1)
+            .map(|value| value | 0x8000_0000)
+            .ok_or(WriterError::TooLarge)?;
+
+        let mut output = version.to_le_bytes().to_vec();
+        output.extend_from_slice(&0_u32.to_le_bytes());
+        output.extend_from_slice(&buffer_pointer.to_le_bytes());
+        write_positive_vlq(
+            &mut output,
+            u32::try_from(nodes.len()).map_err(|_| WriterError::TooLarge)?,
+        );
+        for node in nodes {
+            let identity = node
+                .get("HandleId")
+                .or_else(|| node.get("HandleRefId"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| unsupported("streaming sector node handle identity"))?;
+            let export_index = self
+                .handle_exports
+                .borrow()
+                .get(identity)
+                .copied()
+                .ok_or_else(|| {
+                    unsupported(format!("unknown streaming sector node handle {identity}"))
+                })?;
+            output.extend_from_slice(
+                &u32::try_from(export_index.checked_add(1).ok_or(WriterError::TooLarge)?)
+                    .map_err(|_| WriterError::TooLarge)?
+                    .to_le_bytes(),
+            );
+        }
+
+        let node_refs = object
+            .get("nodeRefs")
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported("worldStreamingSector.nodeRefs"))?;
+        write_positive_vlq(
+            &mut output,
+            u32::try_from(node_refs.len()).map_err(|_| WriterError::TooLarge)?,
+        );
+        for node_ref in node_refs {
+            output.extend_from_slice(&encode_string(storage_value(node_ref)?)?);
+        }
+
+        let variants = object
+            .get("variantIndices")
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported("worldStreamingSector.variantIndices"))?;
+        write_positive_vlq(
+            &mut output,
+            u32::try_from(variants.len()).map_err(|_| WriterError::TooLarge)?,
+        );
+        for variant in variants {
+            let value = variant
+                .as_i64()
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| unsupported("worldStreamingSector.variantIndices value"))?;
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        let persistent_node_index = object
+            .get("persistentNodeIndex")
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .ok_or_else(|| unsupported("worldStreamingSector.persistentNodeIndex"))?;
+        output.extend_from_slice(&persistent_node_index.to_le_bytes());
+        let inner_size =
+            u32::try_from(output.len().saturating_sub(4)).map_err(|_| WriterError::TooLarge)?;
+        write_u32_at(&mut output, 4, inner_size)?;
+        Ok(output)
     }
 
     #[expect(
@@ -502,10 +657,39 @@ impl Encoder<'_> {
                     .ok_or_else(|| unsupported("handle identity"))?;
                 if self.discovering_handles.get() {
                     if let Some(data) = value.get("Data") {
-                        self.handle_exports
-                            .borrow_mut()
-                            .insert(identity.to_owned(), template_export_index);
-                        chunks.insert(template_export_index, data);
+                        let class_name = data
+                            .get("$type")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| unsupported("handle class"))?;
+                        let mapped_export_index =
+                            self.handle_exports.borrow().get(identity).copied();
+                        let export_index = if let Some(export_index) = mapped_export_index {
+                            export_index
+                        } else if self.file.exports[template_export_index].class_name == class_name
+                            && self
+                                .claimed_exports
+                                .borrow_mut()
+                                .insert(template_export_index)
+                        {
+                            self.handle_exports
+                                .borrow_mut()
+                                .insert(identity.to_owned(), template_export_index);
+                            template_export_index
+                        } else {
+                            collect_handle_ids(data, &mut self.candidate_handles.borrow_mut());
+                            self.candidate_handles
+                                .borrow_mut()
+                                .insert(identity.to_owned());
+                            return exact(template_stored.to_le_bytes().to_vec());
+                        };
+                        if let Some(existing) = chunks.insert(export_index, data)
+                            && !std::ptr::eq(existing, data)
+                            && existing != data
+                        {
+                            return Err(unsupported(format!(
+                                "conflicting handle definitions for identity {identity}"
+                            )));
+                        }
                     }
                     return exact(template_stored.to_le_bytes().to_vec());
                 }
@@ -515,11 +699,7 @@ impl Encoder<'_> {
                     .get(identity)
                     .copied()
                     .unwrap_or(template_export_index);
-                let export_index = if mapped_export_index >= self.file.exports.len() {
-                    mapped_export_index
-                } else {
-                    template_export_index
-                };
+                let export_index = mapped_export_index;
                 let stored =
                     u32::try_from(export_index.checked_add(1).ok_or(WriterError::TooLarge)?)
                         .map_err(|_| WriterError::TooLarge)?;
@@ -724,6 +904,31 @@ impl Encoder<'_> {
             .ok_or_else(|| unsupported("string bounds"))
     }
 
+    fn vlq(&self, start: usize) -> Result<(usize, usize), WriterError> {
+        let first = self.byte(start)?;
+        if first & 0x80 != 0 {
+            return Err(unsupported("negative streaming sector count"));
+        }
+        let mut value = usize::from(first & 0x3f);
+        let mut cursor = start + 1;
+        if first & 0x40 != 0 {
+            let mut shift = 6;
+            loop {
+                let byte = self.byte(cursor)?;
+                cursor += 1;
+                value |= usize::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    break;
+                }
+                shift += 7;
+                if shift > 27 {
+                    return Err(unsupported("streaming sector VLQ count"));
+                }
+            }
+        }
+        Ok((value, cursor))
+    }
+
     fn name(&self, index: u16) -> Result<&str, WriterError> {
         self.file
             .names
@@ -821,6 +1026,7 @@ fn collect_new_exports<'a>(
     document: &'a Value,
     file: &Cr2wInspection,
     candidate_handles: &RefCell<HashSet<String>>,
+    handle_exports: &RefCell<HashMap<String, usize>>,
 ) -> Result<Vec<NewExport<'a>>, WriterError> {
     fn visit<'a>(
         value: &'a Value,
@@ -858,10 +1064,11 @@ fn collect_new_exports<'a>(
     let mut definitions = Vec::new();
     visit(document, &mut definitions)?;
     let candidate_handles = candidate_handles.borrow();
+    let handle_exports = handle_exports.borrow();
     let mut new_exports = Vec::new();
     let mut seen = HashMap::<String, &Value>::new();
     for (handle_id, value) in definitions {
-        if !candidate_handles.contains(&handle_id) {
+        if !candidate_handles.contains(&handle_id) || handle_exports.contains_key(&handle_id) {
             continue;
         }
         if let Some(existing) = seen.insert(handle_id.clone(), value)
@@ -883,7 +1090,10 @@ fn collect_new_exports<'a>(
         let template_index = file
             .exports
             .iter()
-            .position(|export| export.class_name == class_name)
+            .enumerate()
+            .filter(|(_, export)| export.class_name == class_name)
+            .max_by_key(|(_, export)| export.data_size)
+            .map(|(index, _)| index)
             .ok_or_else(|| {
                 unsupported(format!(
                     "new export class {class_name} has no template instance"
@@ -1517,6 +1727,18 @@ fn write_negative_vlq(output: &mut Vec<u8>, value: u32) {
     }
 }
 
+fn write_positive_vlq(output: &mut Vec<u8>, value: u32) {
+    let mut remaining = value;
+    let low = u8::try_from(remaining & 0x3f).expect("masked to six bits");
+    remaining >>= 6;
+    output.push(low | if remaining > 0 { 0x40 } else { 0 });
+    while remaining > 0 {
+        let byte = u8::try_from(remaining & 0x7f).expect("masked to seven bits");
+        remaining >>= 7;
+        output.push(byte | if remaining > 0 { 0x80 } else { 0 });
+    }
+}
+
 fn fixed_size(red_type: &str) -> Option<usize> {
     match red_type {
         "Bool" | "Int8" | "Uint8" => Some(1),
@@ -1606,7 +1828,7 @@ fn unsupported(message: impl Into<String>) -> WriterError {
 
 #[cfg(test)]
 mod tests {
-    use super::{collect_handle_ids, write_with_template};
+    use super::{collect_handle_ids, write_positive_vlq, write_with_template};
     use crate::{codec, schema};
     use serde_json::{Value, json};
     use std::{
@@ -1616,6 +1838,20 @@ mod tests {
         fs,
         path::PathBuf,
     };
+
+    #[test]
+    fn write_positive_vlq_encodes_single_and_multi_byte_counts() {
+        let mut output = Vec::new();
+
+        for value in [0, 63, 64, 8_191, 8_192] {
+            write_positive_vlq(&mut output, value);
+        }
+
+        assert_eq!(
+            output,
+            [0x00, 0x3f, 0x40, 0x01, 0x7f, 0x7f, 0x40, 0x80, 0x01]
+        );
+    }
 
     #[test]
     fn collect_handle_ids_includes_nested_definitions() {
