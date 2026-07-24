@@ -219,11 +219,25 @@ fn hash_four_bytes(bytes: &[u8]) -> usize {
 }
 
 fn common_prefix_length(left: &[u8], right: &[u8], maximum: usize) -> usize {
-    left.iter()
-        .zip(right)
-        .take(maximum)
-        .take_while(|(left, right)| left == right)
-        .count()
+    let limit = left.len().min(right.len()).min(maximum);
+    let mut offset = 0_usize;
+    while offset + 16 <= limit {
+        if left[offset..offset + 16] != right[offset..offset + 16] {
+            return offset
+                + left[offset..offset + 16]
+                    .iter()
+                    .zip(&right[offset..offset + 16])
+                    .position(|(left, right)| left != right)
+                    .unwrap_or(16);
+        }
+        offset += 16;
+    }
+    offset
+        + left[offset..limit]
+            .iter()
+            .zip(&right[offset..limit])
+            .position(|(left, right)| left != right)
+            .unwrap_or(limit - offset)
 }
 
 fn encode_scaled_offset(distance: usize) -> Option<(u8, u32, u8)> {
@@ -1762,10 +1776,18 @@ fn copy_match(
             offset: stream_offset,
         });
     }
-    for _ in 0..count {
-        let source = history_index(output.len(), offset, output_start, stream_offset)?;
-        let value = output[source];
-        output.push(value);
+    let source = history_index(output.len(), offset, output_start, stream_offset)?;
+    let mut remaining = count;
+    while remaining != 0 {
+        let available = output.len() - source;
+        let amount = remaining.min(available);
+        let end = source
+            .checked_add(amount)
+            .ok_or(KrakenError::InvalidQuantum {
+                offset: stream_offset,
+            })?;
+        output.extend_from_within(source..end);
+        remaining -= amount;
     }
     Ok(())
 }
