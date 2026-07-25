@@ -196,7 +196,9 @@ layout template:
 
 The template supplies the CR2W tables and layouts. Reflected values, shifted
 offsets, table checksums, typed package buffers, and supported custom
-appendices are rebuilt from the JSON.
+appendices are rebuilt from the JSON. Non-default fixed-size properties absent
+from a template instance can be inserted when their RED type and ordinal are
+available in the generated schema.
 
 Supported structural edits include changed strings and arrays, new CName and
 depot-import entries, typed world-node data, typed RedPackage values, and new

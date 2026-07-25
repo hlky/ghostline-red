@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ghostline_red::{archive, codec, cr2w, kraken, localization, schema, writer};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -271,9 +271,9 @@ fn main() -> Result<()> {
             schema,
             output,
         } => {
-            let classes: HashMap<String, schema::RedClass> =
+            let classes: BTreeMap<String, schema::RedClass> =
                 serde_json::from_slice(&fs::read(schema)?)?;
-            let class_names: BTreeSet<String> = classes.into_keys().collect();
+            let class_names: BTreeSet<String> = classes.keys().cloned().collect();
             let document = codec::decode_exports(&input, &class_names, cli.kraken.as_os_str())?;
             fs::write(output, serde_json::to_vec_pretty(&document)?)?;
         }
@@ -294,14 +294,15 @@ fn main() -> Result<()> {
             schema,
             output,
         } => {
-            let classes: HashMap<String, schema::RedClass> =
+            let classes: BTreeMap<String, schema::RedClass> =
                 serde_json::from_slice(&fs::read(schema)?)?;
-            let class_names: BTreeSet<String> = classes.into_keys().collect();
+            let class_names: BTreeSet<String> = classes.keys().cloned().collect();
             writer::write_with_template(
                 &input,
                 &template,
                 &output,
                 &class_names,
+                &classes,
                 cli.kraken.as_os_str(),
             )?;
         }

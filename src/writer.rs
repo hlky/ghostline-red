@@ -4,6 +4,7 @@ use crate::{
     archive::{self, ArchiveError},
     cr2w::{self, Cr2wError, Cr2wInspection},
     redpackage::{self, PackageError, PackageSettings},
+    schema,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crc32fast::Hasher;
@@ -11,7 +12,7 @@ use serde_json::Value;
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     fs, io,
     path::Path,
@@ -91,6 +92,7 @@ struct Encoder<'a> {
     candidate_handles: RefCell<HashSet<String>>,
     discovering_handles: Cell<bool>,
     classes: &'a BTreeSet<String>,
+    schema: &'a BTreeMap<String, schema::RedClass>,
 }
 
 /// Writes WKit-shaped JSON using an existing CR2W resource as its audited
@@ -113,6 +115,7 @@ pub fn write_with_template(
     template_path: &Path,
     output_path: &Path,
     classes: &BTreeSet<String>,
+    schema: &BTreeMap<String, schema::RedClass>,
     kraken_path: &OsStr,
 ) -> Result<(), WriterError> {
     let document: Value = serde_json::from_slice(&fs::read(json_path)?)?;
@@ -186,6 +189,7 @@ pub fn write_with_template(
         candidate_handles: RefCell::new(HashSet::new()),
         discovering_handles: Cell::new(true),
         classes,
+        schema,
     };
     // Discover the mapping from WKit handle identities to CR2W export indices
     // from the authoritative pointers in the template itself.
@@ -346,6 +350,10 @@ pub fn write_with_template(
 }
 
 impl Encoder<'_> {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "template properties and schema-inserted properties share one ordered class rebuild"
+    )]
     fn encode_class<'v>(
         &self,
         value: &'v Value,
@@ -369,12 +377,13 @@ impl Encoder<'_> {
             return Err(unsupported(format!("{red_type} custom-data chunk")));
         }
         cursor += 1;
-        let mut output = vec![0];
+        let mut encoded_properties = Vec::new();
+        let mut present_properties = HashSet::new();
+        let mut property_order = 0_usize;
         loop {
             let name_index = self.u16(cursor)?;
             cursor += 2;
             if name_index == 0 {
-                output.extend_from_slice(&0_u16.to_le_bytes());
                 break;
             }
             let type_index = self.u16(cursor)?;
@@ -401,16 +410,46 @@ impl Encoder<'_> {
                     "{red_type}.{property} template was not consumed"
                 )));
             }
-            output.extend_from_slice(&name_index.to_le_bytes());
-            output.extend_from_slice(&type_index.to_le_bytes());
-            let encoded_size = u32::try_from(payload.len())
-                .map_err(|_| WriterError::TooLarge)?
-                .checked_add(4)
-                .ok_or(WriterError::TooLarge)?;
-            output.extend_from_slice(&encoded_size.to_le_bytes());
-            output.extend_from_slice(&payload);
+            let ordinal = class_property(self.schema, red_type, property)
+                .and_then(|property| property.ordinal);
+            encoded_properties.push((
+                ordinal,
+                property_order,
+                encode_property(name_index, type_index, &payload)?,
+            ));
+            present_properties.insert(property.to_owned());
+            property_order += 1;
             cursor = payload_end;
         }
+        for (property, property_value) in object {
+            if property == "$type" || present_properties.contains(property) {
+                continue;
+            }
+            let Some(schema_property) = class_property(self.schema, red_type, property) else {
+                continue;
+            };
+            let Some(property_type) = red_type_from_cs(&schema_property.cs_type) else {
+                continue;
+            };
+            if is_default_missing_value(property_value, &property_type) {
+                continue;
+            }
+            let payload = self.encode_new_value(property_value, &property_type)?;
+            let name_index = self.name_index(property)?;
+            let type_index = self.name_index(&property_type)?;
+            encoded_properties.push((
+                schema_property.ordinal,
+                property_order,
+                encode_property(name_index, type_index, &payload)?,
+            ));
+            property_order += 1;
+        }
+        encoded_properties.sort_by_key(|(ordinal, order, _)| (ordinal.unwrap_or(u32::MAX), *order));
+        let mut output = vec![0];
+        for (_, _, property) in encoded_properties {
+            output.extend_from_slice(&property);
+        }
+        output.extend_from_slice(&0_u16.to_le_bytes());
         if red_type == "worldStreamingSector" {
             output.extend_from_slice(&self.encode_streaming_sector_appendix(
                 object,
@@ -431,6 +470,71 @@ impl Encoder<'_> {
             return Ok((output, template_end));
         }
         Ok((output, cursor))
+    }
+
+    fn encode_new_value(&self, value: &Value, red_type: &str) -> Result<Vec<u8>, WriterError> {
+        match red_type {
+            "Bool" => Ok(vec![u8::from(json_bool(value)?)]),
+            "Int8" => Ok(i8::try_from(json_i64(value)?)
+                .map_err(|_| unsupported("Int8 range"))?
+                .to_le_bytes()
+                .to_vec()),
+            "Uint8" => Ok(vec![
+                u8::try_from(json_u64(value)?).map_err(|_| unsupported("Uint8 range"))?,
+            ]),
+            "Int16" => Ok(i16::try_from(json_i64(value)?)
+                .map_err(|_| unsupported("Int16 range"))?
+                .to_le_bytes()
+                .to_vec()),
+            "Uint16" => Ok(u16::try_from(json_u64(value)?)
+                .map_err(|_| unsupported("Uint16 range"))?
+                .to_le_bytes()
+                .to_vec()),
+            "Int32" => Ok(i32::try_from(json_i64(value)?)
+                .map_err(|_| unsupported("Int32 range"))?
+                .to_le_bytes()
+                .to_vec()),
+            "Uint32" => Ok(u32::try_from(json_u64(value)?)
+                .map_err(|_| unsupported("Uint32 range"))?
+                .to_le_bytes()
+                .to_vec()),
+            "Int64" => Ok(json_string_i64(value)?.to_le_bytes().to_vec()),
+            "Uint64" | "CRUID" | "CDateTime" => Ok(json_string_u64(value)?.to_le_bytes().to_vec()),
+            "Float" => Ok(json_f32(value)?.to_le_bytes().to_vec()),
+            "Double" => Ok(json_f64(value)?.to_le_bytes().to_vec()),
+            "CName" => Ok(self
+                .name_index(storage_value(value)?)?
+                .to_le_bytes()
+                .to_vec()),
+            "String" => encode_string(value.as_str().ok_or_else(|| unsupported("String value"))?),
+            "NodeRef" => encode_string(storage_value(value)?),
+            "TweakDBID" => Ok(tweak_db_id(storage_or_string(value)?)?
+                .to_le_bytes()
+                .to_vec()),
+            _ if red_type.starts_with("array:") => {
+                let values = value.as_array().ok_or_else(|| unsupported("array value"))?;
+                let inner = &red_type[6..];
+                let mut output = u32::try_from(values.len())
+                    .map_err(|_| WriterError::TooLarge)?
+                    .to_le_bytes()
+                    .to_vec();
+                for value in values {
+                    output.extend_from_slice(&self.encode_new_value(value, inner)?);
+                }
+                Ok(output)
+            }
+            _ if value.is_string() => Ok(self
+                .name_index(normalize_wolvenkit_enum_name(
+                    value
+                        .as_str()
+                        .ok_or_else(|| unsupported(format!("{red_type} enum")))?,
+                ))?
+                .to_le_bytes()
+                .to_vec()),
+            _ => Err(unsupported(format!(
+                "cannot synthesize missing property type {red_type}"
+            ))),
+        }
     }
 
     fn encode_device_data_appendix(
@@ -1087,6 +1191,23 @@ fn collect_handle_ids(value: &Value, identities: &mut HashSet<String>) {
     }
 }
 
+fn encode_property(
+    name_index: u16,
+    type_index: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, WriterError> {
+    let encoded_size = u32::try_from(payload.len())
+        .map_err(|_| WriterError::TooLarge)?
+        .checked_add(4)
+        .ok_or(WriterError::TooLarge)?;
+    let mut output = Vec::with_capacity(payload.len() + 8);
+    output.extend_from_slice(&name_index.to_le_bytes());
+    output.extend_from_slice(&type_index.to_le_bytes());
+    output.extend_from_slice(&encoded_size.to_le_bytes());
+    output.extend_from_slice(payload);
+    Ok(output)
+}
+
 fn compact_export_indices<T>(chunks: &HashMap<usize, T>) -> (Vec<usize>, HashMap<usize, usize>) {
     let mut indices: Vec<_> = chunks.keys().copied().collect();
     indices.sort_unstable();
@@ -1097,6 +1218,88 @@ fn compact_export_indices<T>(chunks: &HashMap<usize, T>) -> (Vec<usize>, HashMap
         .map(|(compact, source)| (source, compact))
         .collect();
     (indices, remap)
+}
+
+fn class_property<'a>(
+    classes: &'a BTreeMap<String, schema::RedClass>,
+    class_name: &str,
+    property: &str,
+) -> Option<&'a schema::RedProperty> {
+    let mut current = Some(class_name);
+    let mut visited = HashSet::new();
+    while let Some(name) = current {
+        if !visited.insert(name) {
+            return None;
+        }
+        let class = classes.get(name)?;
+        if let Some(property) = class.properties.get(property) {
+            return Some(property);
+        }
+        current = class.base.as_deref();
+    }
+    None
+}
+
+fn red_type_from_cs(cs_type: &str) -> Option<String> {
+    let compact: String = cs_type
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect();
+    let primitive = match compact.as_str() {
+        "CBool" => "Bool",
+        "CInt8" => "Int8",
+        "CUInt8" => "Uint8",
+        "CInt16" => "Int16",
+        "CUInt16" => "Uint16",
+        "CInt32" => "Int32",
+        "CUInt32" => "Uint32",
+        "CInt64" => "Int64",
+        "CUInt64" => "Uint64",
+        "CFloat" => "Float",
+        "CDouble" => "Double",
+        "CName" => "CName",
+        "CString" => "String",
+        "NodeRef" => "NodeRef",
+        "TweakDBID" => "TweakDBID",
+        "CRUID" => "CRUID",
+        _ => {
+            if let Some(inner) = compact
+                .strip_prefix("CEnum<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                return Some(inner.to_owned());
+            }
+            if let Some(inner) = compact
+                .strip_prefix("CArray<")
+                .and_then(|value| value.strip_suffix('>'))
+            {
+                return red_type_from_cs(inner).map(|red_type| format!("array:{red_type}"));
+            }
+            return None;
+        }
+    };
+    Some(primitive.to_owned())
+}
+
+fn is_default_missing_value(value: &Value, red_type: &str) -> bool {
+    if value.is_null()
+        || value.as_bool() == Some(false)
+        || value.as_i64() == Some(0)
+        || value.as_u64() == Some(0)
+        || value.as_f64() == Some(0.0)
+        || value.as_array().is_some_and(Vec::is_empty)
+    {
+        return true;
+    }
+    if value
+        .as_str()
+        .is_some_and(|value| value.is_empty() || value.starts_with("default__"))
+    {
+        return true;
+    }
+    let stored = value.get("$value").and_then(Value::as_str);
+    matches!(red_type, "NodeRef" | "TweakDBID" | "CName")
+        && stored.is_some_and(|value| matches!(value, "" | "0" | "None"))
 }
 
 fn handle_identity(
@@ -2032,14 +2235,14 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        area_shape_outline_buffer, collect_handle_ids, compact_export_indices,
-        encode_device_data_entry, handle_identity, normalize_wolvenkit_enum_name,
-        write_positive_vlq, write_with_template,
+        area_shape_outline_buffer, class_property, collect_handle_ids, compact_export_indices,
+        encode_device_data_entry, handle_identity, is_default_missing_value, json_bool,
+        normalize_wolvenkit_enum_name, red_type_from_cs, write_positive_vlq, write_with_template,
     };
     use crate::{codec, cr2w, schema};
     use serde_json::{Value, json};
     use std::{
-        collections::{BTreeSet, HashMap, HashSet},
+        collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         env,
         ffi::OsStr,
         fs,
@@ -2068,6 +2271,69 @@ mod tests {
             normalize_wolvenkit_enum_name("default__false_"),
             "default__false_"
         );
+    }
+
+    #[test]
+    fn schema_types_map_to_red_property_types() {
+        assert_eq!(red_type_from_cs("CBool"), Some("Bool".to_owned()));
+        assert_eq!(
+            red_type_from_cs("CEnum<gameAlwaysSpawnedState>"),
+            Some("gameAlwaysSpawnedState".to_owned())
+        );
+        assert_eq!(
+            red_type_from_cs("CArray<CName>"),
+            Some("array:CName".to_owned())
+        );
+        assert_eq!(red_type_from_cs("CHandle<worldNode>"), None);
+    }
+
+    #[test]
+    fn missing_default_properties_remain_implicit() {
+        assert!(is_default_missing_value(
+            &json!({"$type": "NodeRef", "$storage": "uint64", "$value": "0"}),
+            "NodeRef"
+        ));
+        assert!(is_default_missing_value(&json!([]), "array:CName"));
+        assert!(is_default_missing_value(
+            &json!("default__false_"),
+            "gameAlwaysSpawnedState"
+        ));
+        assert!(!is_default_missing_value(&json!(1), "Bool"));
+        assert!(!is_default_missing_value(
+            &json!([{"$type": "CName", "$storage": "string", "$value": "custom"}]),
+            "array:CName"
+        ));
+    }
+
+    #[test]
+    fn class_property_resolves_inherited_schema_fields() {
+        let classes = BTreeMap::from([
+            (
+                "Base".to_owned(),
+                schema::RedClass {
+                    base: None,
+                    properties: std::collections::BTreeMap::from([(
+                        "enabled".to_owned(),
+                        schema::RedProperty {
+                            cs_type: "CBool".to_owned(),
+                            ordinal: Some(0),
+                        },
+                    )]),
+                },
+            ),
+            (
+                "Child".to_owned(),
+                schema::RedClass {
+                    base: Some("Base".to_owned()),
+                    properties: std::collections::BTreeMap::new(),
+                },
+            ),
+        ]);
+
+        let property = class_property(&classes, "Child", "enabled").unwrap();
+
+        assert_eq!(property.cs_type, "CBool");
+        assert_eq!(property.ordinal, Some(0));
     }
 
     #[test]
@@ -2174,9 +2440,9 @@ mod tests {
     fn serialized_cr2w_fixture_round_trips_and_applies_edits() {
         let fixture = env::var_os("CR2W_FIXTURE").map(PathBuf::from).unwrap();
         let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
-        let classes: HashMap<String, schema::RedClass> =
+        let classes: BTreeMap<String, schema::RedClass> =
             serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
-        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let class_names: BTreeSet<String> = classes.keys().cloned().collect();
         let missing_dll = OsStr::new("missing-kraken.dll");
         let mut document = codec::decode_wkit(&fixture, &class_names, missing_dll).unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -2189,6 +2455,7 @@ mod tests {
             &fixture,
             &output_path,
             &class_names,
+            &classes,
             missing_dll,
         )
         .unwrap();
@@ -2210,6 +2477,7 @@ mod tests {
             &fixture,
             &output_path,
             &class_names,
+            &classes,
             missing_dll,
         )
         .unwrap();
@@ -2236,9 +2504,9 @@ mod tests {
             .parse::<usize>()
             .unwrap();
         let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
-        let classes: HashMap<String, schema::RedClass> =
+        let classes: BTreeMap<String, schema::RedClass> =
             serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
-        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let class_names: BTreeSet<String> = classes.keys().cloned().collect();
         let workspace = tempfile::tempdir().unwrap();
         let output_path = workspace.path().join("pruned.cr2w");
         let missing_dll = OsStr::new("missing-kraken.dll");
@@ -2248,6 +2516,7 @@ mod tests {
             &fixture,
             &output_path,
             &class_names,
+            &classes,
             missing_dll,
         )
         .unwrap();
@@ -2263,6 +2532,54 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "real missing-property fixture; requires CR2W_SCALAR_JSON, CR2W_SCALAR_TEMPLATE, and RED_SCHEMA"]
+    fn serialized_cr2w_fixture_adds_missing_schema_properties() {
+        let json_path = env::var_os("CR2W_SCALAR_JSON").map(PathBuf::from).unwrap();
+        let fixture = env::var_os("CR2W_SCALAR_TEMPLATE")
+            .map(PathBuf::from)
+            .unwrap();
+        let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
+        let classes: BTreeMap<String, schema::RedClass> =
+            serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
+        let class_names: BTreeSet<String> = classes.keys().cloned().collect();
+        let authored: Value = serde_json::from_slice(&fs::read(&json_path).unwrap()).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let output_path = workspace.path().join("scalar.cr2w");
+        let missing_dll = OsStr::new("missing-kraken.dll");
+
+        write_with_template(
+            &json_path,
+            &fixture,
+            &output_path,
+            &class_names,
+            &classes,
+            missing_dll,
+        )
+        .unwrap();
+        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+
+        let active = "/Data/RootChunk/nodes/2/Data/communitiesData/0/entriesInitialState/0/entryActiveOnStart";
+        assert_eq!(
+            json_bool(decoded.pointer(active).unwrap()).unwrap(),
+            json_bool(authored.pointer(active).unwrap()).unwrap()
+        );
+        let always_spawned = "/Data/RootChunk/nodes/2/Data/communitiesData/0/template/Data/entries/0/Data/phases/0/Data/alwaysSpawned";
+        assert_eq!(
+            decoded.pointer(always_spawned).and_then(Value::as_str),
+            authored
+                .pointer(always_spawned)
+                .and_then(Value::as_str)
+                .map(normalize_wolvenkit_enum_name)
+        );
+        let appearances = "/Data/RootChunk/nodes/2/Data/communitiesData/0/template/Data/entries/0/Data/phases/0/Data/appearances";
+        assert_eq!(
+            decoded.pointer(appearances),
+            authored.pointer(appearances),
+            "missing appearance property differs"
+        );
+    }
+
+    #[test]
     #[ignore = "real RedPackage fixture; requires REDPACKAGE_JSON, REDPACKAGE_TEMPLATE, and RED_SCHEMA"]
     fn redpackage_fixture_resolves_buffer_identity_and_preserves_device_state() {
         let json_path = env::var_os("REDPACKAGE_JSON").map(PathBuf::from).unwrap();
@@ -2270,9 +2587,9 @@ mod tests {
             .map(PathBuf::from)
             .unwrap();
         let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
-        let classes: HashMap<String, schema::RedClass> =
+        let classes: BTreeMap<String, schema::RedClass> =
             serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
-        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let class_names: BTreeSet<String> = classes.keys().cloned().collect();
         let workspace = tempfile::tempdir().unwrap();
         let output_path = workspace.path().join("redpackage.streamingsector");
         let missing_dll = OsStr::new("missing-kraken.dll");
@@ -2282,6 +2599,7 @@ mod tests {
             &fixture,
             &output_path,
             &class_names,
+            &classes,
             missing_dll,
         )
         .unwrap();
@@ -2306,9 +2624,9 @@ mod tests {
             .map(PathBuf::from)
             .unwrap();
         let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
-        let classes: HashMap<String, schema::RedClass> =
+        let classes: BTreeMap<String, schema::RedClass> =
             serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
-        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let class_names: BTreeSet<String> = classes.keys().cloned().collect();
         let workspace = tempfile::tempdir().unwrap();
         let json_path = workspace.path().join("grown.json");
         let output_path = workspace.path().join("grown.streamingsector");
@@ -2322,6 +2640,7 @@ mod tests {
             &fixture,
             &output_path,
             &class_names,
+            &classes,
             missing_dll,
         )
         .unwrap();
