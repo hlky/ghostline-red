@@ -205,8 +205,10 @@ depot-import entries, typed world-node data, typed RedPackage values, and new
 exports when growing a non-empty handle array whose class already has a
 template instance. Exports disconnected from the authored JSON handle graph
 are pruned, and retained handle, parent, and embedded-file indices are
-compacted to match the rebuilt export table. Entirely novel RED classes and
-RedPackage chunk-topology changes remain template-bound.
+compacted to match the rebuilt export table. Unreferenced imports are removed,
+with resource and embedded-file import indices remapped to the compact table.
+Entirely novel RED classes and RedPackage chunk-topology changes remain
+template-bound.
 
 ## LXRS metadata
 
