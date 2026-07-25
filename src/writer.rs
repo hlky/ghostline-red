@@ -9,6 +9,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crc32fast::Hasher;
 use serde_json::Value;
 use std::{
+    borrow::Cow,
     cell::{Cell, RefCell},
     collections::{BTreeSet, HashMap, HashSet},
     ffi::OsStr,
@@ -387,16 +388,46 @@ impl Encoder<'_> {
             )?);
             return Ok((output, template_end));
         }
-        if matches!(
-            red_type,
-            "worldStreamingWorld" | "gameDeviceResourceData" | "CMaterialInstance"
-        ) {
+        if red_type == "gameDeviceResourceData" {
+            output.extend_from_slice(&self.encode_device_data_appendix(object)?);
+            return Ok((output, template_end));
+        }
+        if matches!(red_type, "worldStreamingWorld" | "CMaterialInstance") {
             // Typed reverse appendix codecs are connected separately; until
             // then the audited template bytes remain authoritative.
             output.extend_from_slice(&self.template[cursor..template_end]);
             return Ok((output, template_end));
         }
         Ok((output, cursor))
+    }
+
+    fn encode_device_data_appendix(
+        &self,
+        object: &serde_json::Map<String, Value>,
+    ) -> Result<Vec<u8>, WriterError> {
+        let entries = object
+            .get("unk1")
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported("gameDeviceResourceData.unk1"))?;
+        let mut output = vec![0_u8; 4];
+        output.extend_from_slice(
+            &u32::try_from(entries.len())
+                .map_err(|_| WriterError::TooLarge)?
+                .to_le_bytes(),
+        );
+        for entry in entries {
+            let class_name = entry
+                .pointer("/className/$value")
+                .and_then(Value::as_str)
+                .ok_or_else(|| unsupported("device data className"))?;
+            output.extend_from_slice(&encode_device_data_entry(
+                entry,
+                self.name_index(class_name)?,
+            )?);
+        }
+        let size = u32::try_from(output.len()).map_err(|_| WriterError::TooLarge)?;
+        write_u32_at(&mut output, 0, size)?;
+        Ok(output)
     }
 
     #[expect(
@@ -650,11 +681,7 @@ impl Encoder<'_> {
                         .ok_or_else(|| unsupported("non-null handle has null template"))?,
                 )
                 .map_err(|_| WriterError::TooLarge)?;
-                let identity = value
-                    .get("HandleId")
-                    .or_else(|| value.get("HandleRefId"))
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| unsupported("handle identity"))?;
+                let identity = handle_identity(value, template_export_index)?;
                 if self.discovering_handles.get() {
                     if let Some(data) = value.get("Data") {
                         let class_name = data
@@ -662,7 +689,7 @@ impl Encoder<'_> {
                             .and_then(Value::as_str)
                             .ok_or_else(|| unsupported("handle class"))?;
                         let mapped_export_index =
-                            self.handle_exports.borrow().get(identity).copied();
+                            self.handle_exports.borrow().get(identity.as_ref()).copied();
                         let export_index = if let Some(export_index) = mapped_export_index {
                             export_index
                         } else if self.file.exports[template_export_index].class_name == class_name
@@ -673,13 +700,13 @@ impl Encoder<'_> {
                         {
                             self.handle_exports
                                 .borrow_mut()
-                                .insert(identity.to_owned(), template_export_index);
+                                .insert(identity.to_string(), template_export_index);
                             template_export_index
                         } else {
                             collect_handle_ids(data, &mut self.candidate_handles.borrow_mut());
                             self.candidate_handles
                                 .borrow_mut()
-                                .insert(identity.to_owned());
+                                .insert(identity.to_string());
                             return exact(template_stored.to_le_bytes().to_vec());
                         };
                         if let Some(existing) = chunks.insert(export_index, data)
@@ -696,7 +723,7 @@ impl Encoder<'_> {
                 let mapped_export_index = self
                     .handle_exports
                     .borrow()
-                    .get(identity)
+                    .get(identity.as_ref())
                     .copied()
                     .unwrap_or(template_export_index);
                 let export_index = mapped_export_index;
@@ -1020,6 +1047,60 @@ fn collect_handle_ids(value: &Value, identities: &mut HashSet<String>) {
         }
         _ => {}
     }
+}
+
+fn handle_identity(
+    value: &Value,
+    template_export_index: usize,
+) -> Result<Cow<'_, str>, WriterError> {
+    if let Some(identity) = value
+        .get("HandleId")
+        .or_else(|| value.get("HandleRefId"))
+        .and_then(Value::as_str)
+    {
+        return Ok(Cow::Borrowed(identity));
+    }
+    if value.get("Data").is_some() {
+        let identity = template_export_index
+            .checked_sub(1)
+            .ok_or_else(|| unsupported("root handle identity"))?;
+        return Ok(Cow::Owned(identity.to_string()));
+    }
+    Err(unsupported("handle identity"))
+}
+
+fn encode_device_data_entry(entry: &Value, class_name_index: u16) -> Result<Vec<u8>, WriterError> {
+    let mut output = entry
+        .get("hash")
+        .ok_or_else(|| unsupported("device data hash"))
+        .and_then(json_string_u64)?
+        .to_le_bytes()
+        .to_vec();
+    output.extend_from_slice(&class_name_index.to_le_bytes());
+    for field in ["children", "parents"] {
+        let values = entry
+            .get(field)
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported(format!("device data {field}")))?;
+        write_positive_vlq(
+            &mut output,
+            u32::try_from(values.len()).map_err(|_| WriterError::TooLarge)?,
+        );
+        for value in values {
+            output.extend_from_slice(&json_string_u64(value)?.to_le_bytes());
+        }
+    }
+    for component in ["X", "Y", "Z"] {
+        output.extend_from_slice(
+            &entry
+                .get("nodePosition")
+                .and_then(|position| position.get(component))
+                .ok_or_else(|| unsupported(format!("device data nodePosition.{component}")))
+                .and_then(json_f32)?
+                .to_le_bytes(),
+        );
+    }
+    Ok(output)
 }
 
 fn collect_new_exports<'a>(
@@ -1837,7 +1918,8 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_handle_ids, normalize_wolvenkit_enum_name, write_positive_vlq, write_with_template,
+        collect_handle_ids, encode_device_data_entry, handle_identity,
+        normalize_wolvenkit_enum_name, write_positive_vlq, write_with_template,
     };
     use crate::{codec, schema};
     use serde_json::{Value, json};
@@ -1902,6 +1984,56 @@ mod tests {
                 "objective".to_owned(),
                 "mappin".to_owned()
             ])
+        );
+    }
+
+    #[test]
+    fn handle_identity_uses_template_export_for_wolvenkit_definition_without_id() {
+        let value = json!({
+            "Data": {
+                "$type": "gameDeviceResourceData",
+                "version": 2
+            }
+        });
+
+        assert_eq!(handle_identity(&value, 1).unwrap(), "0");
+    }
+
+    #[test]
+    fn handle_identity_rejects_anonymous_reference() {
+        let error = handle_identity(&json!({}), 0).unwrap_err();
+
+        assert!(error.to_string().contains("handle identity"));
+    }
+
+    #[test]
+    fn device_data_entry_encodes_wolvenkit_appendix_fields() {
+        let entry = json!({
+            "hash": "9344050286950689347",
+            "children": ["11"],
+            "parents": ["22"],
+            "nodePosition": {"X": -1078.0032, "Y": 1317.9282, "Z": 5.174_843}
+        });
+
+        let encoded = encode_device_data_entry(&entry, 7).unwrap();
+
+        assert_eq!(
+            u64::from_le_bytes(encoded[0..8].try_into().unwrap()),
+            9_344_050_286_950_689_347
+        );
+        assert_eq!(u16::from_le_bytes(encoded[8..10].try_into().unwrap()), 7);
+        assert_eq!(encoded[10], 1);
+        assert_eq!(u64::from_le_bytes(encoded[11..19].try_into().unwrap()), 11);
+        assert_eq!(encoded[19], 1);
+        assert_eq!(u64::from_le_bytes(encoded[20..28].try_into().unwrap()), 22);
+        assert!(
+            (f32::from_le_bytes(encoded[28..32].try_into().unwrap()) + 1078.0032).abs() < 0.001
+        );
+        assert!(
+            (f32::from_le_bytes(encoded[32..36].try_into().unwrap()) - 1317.9282).abs() < 0.001
+        );
+        assert!(
+            (f32::from_le_bytes(encoded[36..40].try_into().unwrap()) - 5.174_843).abs() < 0.001
         );
     }
 
