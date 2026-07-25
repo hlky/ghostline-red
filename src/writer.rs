@@ -208,6 +208,11 @@ pub fn write_with_template(
         classes,
         schema,
     };
+    // Seed discovery with every authored handle definition. Template-shaped
+    // traversal can skip handles that only become reachable after array
+    // growth or socket rewiring, but the second encoding pass must still have
+    // a stable export mapping for those authored definitions.
+    collect_handle_ids(&document, &mut encoder.candidate_handles.borrow_mut());
     // Discover the mapping from WKit handle identities to CR2W export indices
     // from the authoritative pointers in the template itself.
     for index in 0..file.exports.len() {
@@ -906,7 +911,11 @@ impl Encoder<'_> {
                             .get(&template_export_index)
                             .copied()
                     })
-                    .ok_or_else(|| unsupported("handle references a pruned export"))?;
+                    .ok_or_else(|| {
+                        unsupported(format!(
+                            "handle {identity} references pruned template export {template_export_index}"
+                        ))
+                    })?;
                 let export_index = mapped_export_index;
                 let stored =
                     u32::try_from(export_index.checked_add(1).ok_or(WriterError::TooLarge)?)
@@ -2645,6 +2654,82 @@ mod tests {
         assert_eq!(output_exports, expected_exports);
         assert_eq!(output.imports.len(), expected_imports);
         codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+    }
+
+    #[test]
+    #[ignore = "real authored-handle fixture; requires CR2W_HANDLE_JSON, CR2W_HANDLE_TEMPLATE, and RED_SCHEMA"]
+    fn serialized_cr2w_fixture_preserves_authored_handle_graph_after_pruning() {
+        let json_path = env::var_os("CR2W_HANDLE_JSON").map(PathBuf::from).unwrap();
+        let fixture = env::var_os("CR2W_HANDLE_TEMPLATE")
+            .map(PathBuf::from)
+            .unwrap();
+        let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
+        let classes: BTreeMap<String, schema::RedClass> =
+            serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
+        let class_names: BTreeSet<String> = classes.keys().cloned().collect();
+        let authored: Value = serde_json::from_slice(&fs::read(&json_path).unwrap()).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let output_path = workspace.path().join("authored-handles.cr2w");
+        let missing_dll = OsStr::new("missing-kraken.dll");
+
+        write_with_template(
+            &json_path,
+            &fixture,
+            &output_path,
+            &class_names,
+            &classes,
+            missing_dll,
+        )
+        .unwrap();
+
+        let decoded = codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
+        let authored_nodes = authored
+            .pointer("/Data/RootChunk/graph/Data/nodes")
+            .and_then(Value::as_array)
+            .unwrap();
+        let decoded_nodes = decoded
+            .pointer("/Data/RootChunk/graph/Data/nodes")
+            .and_then(Value::as_array)
+            .unwrap();
+        let node_signature = |nodes: &[Value]| {
+            nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.pointer("/Data/$type")
+                            .and_then(Value::as_str)
+                            .map(ToOwned::to_owned),
+                        node.pointer("/Data/id").and_then(Value::as_i64),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            node_signature(decoded_nodes),
+            node_signature(authored_nodes),
+            "serialized quest node population differs from the authored graph"
+        );
+        let logical_and = decoded_nodes
+            .iter()
+            .find(|node| {
+                node.pointer("/Data/$type").and_then(Value::as_str)
+                    == Some("questLogicalAndNodeDefinition")
+            })
+            .unwrap();
+        assert_eq!(
+            logical_and
+                .pointer("/Data/inputSocketCount")
+                .and_then(Value::as_i64),
+            Some(3)
+        );
+        assert_eq!(
+            logical_and
+                .pointer("/Data/sockets")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(5),
+            "parallel join sockets were not preserved"
+        );
     }
 
     #[test]

@@ -166,6 +166,9 @@ fn expand_handles(
                 .and_then(|value| value.as_u64())
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or_else(|| malformed(0, "handle index"))?;
+            if index == usize::try_from(u32::MAX).expect("u32 always fits in usize") {
+                return Ok(Value::Null);
+            }
             if !visited.insert(index) {
                 let handle_id = index
                     .checked_sub(1)
@@ -934,5 +937,18 @@ fn malformed(offset: usize, reason: &'static str) -> CodecError {
 fn unsupported(red_type: &str) -> CodecError {
     CodecError::Unsupported {
         red_type: red_type.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_handles_decodes_zero_pointer_as_null() {
+        let value = json!({"$handle": u32::MAX});
+        let expanded = expand_handles(value, &[], &mut HashSet::new()).unwrap();
+
+        assert_eq!(expanded, Value::Null);
     }
 }
