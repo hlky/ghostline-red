@@ -763,11 +763,11 @@ impl Encoder<'_> {
                 self.encode_class(value, template_start, template_size, red_type, chunks)
             }
             _ if template_size == 2 => exact(
-                self.name_index(
+                self.name_index(normalize_wolvenkit_enum_name(
                     value
                         .as_str()
                         .ok_or_else(|| unsupported(format!("{red_type} enum")))?,
-                )?
+                ))?
                 .to_le_bytes()
                 .to_vec(),
             ),
@@ -1826,9 +1826,19 @@ fn unsupported(message: impl Into<String>) -> WriterError {
     WriterError::Unsupported(message.into())
 }
 
+fn normalize_wolvenkit_enum_name(value: &str) -> &str {
+    match value {
+        "false_" => "false",
+        "true_" => "true",
+        _ => value,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{collect_handle_ids, write_positive_vlq, write_with_template};
+    use super::{
+        collect_handle_ids, normalize_wolvenkit_enum_name, write_positive_vlq, write_with_template,
+    };
     use crate::{codec, schema};
     use serde_json::{Value, json};
     use std::{
@@ -1850,6 +1860,16 @@ mod tests {
         assert_eq!(
             output,
             [0x00, 0x3f, 0x40, 0x01, 0x7f, 0x7f, 0x40, 0x80, 0x01]
+        );
+    }
+
+    #[test]
+    fn wolvenkit_boolean_enum_names_map_to_red_names() {
+        assert_eq!(normalize_wolvenkit_enum_name("true_"), "true");
+        assert_eq!(normalize_wolvenkit_enum_name("false_"), "false");
+        assert_eq!(
+            normalize_wolvenkit_enum_name("default__false_"),
+            "default__false_"
         );
     }
 
