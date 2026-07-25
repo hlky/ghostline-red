@@ -201,8 +201,10 @@ appendices are rebuilt from the JSON.
 Supported structural edits include changed strings and arrays, new CName and
 depot-import entries, typed world-node data, typed RedPackage values, and new
 exports when growing a non-empty handle array whose class already has a
-template instance. Entirely novel RED classes and RedPackage chunk-topology
-changes remain template-bound.
+template instance. Exports disconnected from the authored JSON handle graph
+are pruned, and retained handle, parent, and embedded-file indices are
+compacted to match the rebuilt export table. Entirely novel RED classes and
+RedPackage chunk-topology changes remain template-bound.
 
 ## LXRS metadata
 

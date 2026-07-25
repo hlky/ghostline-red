@@ -86,6 +86,7 @@ struct Encoder<'a> {
     imports: RefCell<HashMap<String, u16>>,
     new_imports: RefCell<Vec<NewImport>>,
     handle_exports: RefCell<HashMap<String, usize>>,
+    export_remap: RefCell<HashMap<usize, usize>>,
     claimed_exports: RefCell<HashSet<usize>>,
     candidate_handles: RefCell<HashSet<String>>,
     discovering_handles: Cell<bool>,
@@ -95,8 +96,9 @@ struct Encoder<'a> {
 /// Writes WKit-shaped JSON using an existing CR2W resource as its audited
 /// table, chunk-layout, and buffer template.
 ///
-/// Reflected values and strings are rebuilt. Chunks absent from the JSON handle
-/// graph, custom appendices, and buffer payloads are retained byte-for-byte.
+/// Reflected values and strings are rebuilt. Export chunks absent from the
+/// authored JSON handle graph are pruned; custom appendices and buffer payloads
+/// are retained byte-for-byte unless the JSON provides a supported override.
 ///
 /// # Errors
 ///
@@ -179,6 +181,7 @@ pub fn write_with_template(
         ),
         new_imports: RefCell::new(Vec::new()),
         handle_exports: RefCell::new(HashMap::new()),
+        export_remap: RefCell::new(HashMap::new()),
         claimed_exports: RefCell::new(HashSet::new()),
         candidate_handles: RefCell::new(HashSet::new()),
         discovering_handles: Cell::new(true),
@@ -217,18 +220,50 @@ pub fn write_with_template(
     }
     encoder.discovering_handles.set(false);
 
+    let (export_indices, export_remap) = compact_export_indices(&chunks);
+    if export_indices.first() != Some(&0) {
+        return Err(unsupported(
+            "authored graph does not retain the root export",
+        ));
+    }
+    {
+        let mut handle_exports = encoder.handle_exports.borrow_mut();
+        for export_index in handle_exports.values_mut() {
+            *export_index = export_remap
+                .get(export_index)
+                .copied()
+                .ok_or_else(|| unsupported("authored handle maps to a pruned export"))?;
+        }
+    }
+    *encoder.export_remap.borrow_mut() = export_remap;
+    let mut compact_chunks = HashMap::with_capacity(chunks.len());
+    for (compact_index, source_index) in export_indices.iter().copied().enumerate() {
+        let value = chunks
+            .remove(&source_index)
+            .ok_or_else(|| unsupported("missing authored export chunk"))?;
+        compact_chunks.insert(compact_index, value);
+    }
+    chunks = compact_chunks;
+
     let new_names = encoder.new_names.borrow().clone();
     let mut name_values: Vec<String> = file.names.iter().map(|name| name.value.clone()).collect();
     name_values.extend(new_names.iter().cloned());
     let new_imports = encoder.new_imports.borrow().clone();
-    let (mut output, prefix_layout) =
-        build_prefix(&template, &file, &name_values, &new_imports, &new_exports)?;
-    let mut export_layout = Vec::with_capacity(file.exports.len() + new_exports.len());
-    for index in 0..file.exports.len() + new_exports.len() {
-        let (export, class_name) = if let Some(export) = file.exports.get(index) {
+    let (mut output, prefix_layout) = build_prefix(
+        &template,
+        &file,
+        &name_values,
+        &new_imports,
+        &new_exports,
+        &export_indices,
+        &encoder.export_remap.borrow(),
+    )?;
+    let mut export_layout = Vec::with_capacity(export_indices.len());
+    for (index, source_index) in export_indices.iter().copied().enumerate() {
+        let (export, class_name) = if let Some(export) = file.exports.get(source_index) {
             (export, export.class_name.as_str())
         } else {
-            let new_export = &new_exports[index - file.exports.len()];
+            let new_export = &new_exports[source_index - file.exports.len()];
             (
                 &file.exports[new_export.template_index],
                 new_export.class_name.as_str(),
@@ -722,7 +757,13 @@ impl Encoder<'_> {
                     .borrow()
                     .get(identity.as_ref())
                     .copied()
-                    .unwrap_or(template_export_index);
+                    .or_else(|| {
+                        self.export_remap
+                            .borrow()
+                            .get(&template_export_index)
+                            .copied()
+                    })
+                    .ok_or_else(|| unsupported("handle references a pruned export"))?;
                 let export_index = mapped_export_index;
                 let stored =
                     u32::try_from(export_index.checked_add(1).ok_or(WriterError::TooLarge)?)
@@ -1046,6 +1087,18 @@ fn collect_handle_ids(value: &Value, identities: &mut HashSet<String>) {
     }
 }
 
+fn compact_export_indices<T>(chunks: &HashMap<usize, T>) -> (Vec<usize>, HashMap<usize, usize>) {
+    let mut indices: Vec<_> = chunks.keys().copied().collect();
+    indices.sort_unstable();
+    let remap = indices
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(compact, source)| (source, compact))
+        .collect();
+    (indices, remap)
+}
+
 fn handle_identity(
     value: &Value,
     template_export_index: usize,
@@ -1205,6 +1258,8 @@ fn build_prefix(
     names: &[String],
     new_imports: &[NewImport],
     new_exports: &[NewExport<'_>],
+    export_indices: &[usize],
+    export_remap: &HashMap<usize, usize>,
 ) -> Result<(Vec<u8>, PrefixLayout), WriterError> {
     const ITEM_SIZES: [usize; 10] = [1, 8, 8, 16, 24, 24, 16, 0, 0, 0];
     let mut output = template
@@ -1226,7 +1281,9 @@ fn build_prefix(
         let old_end = old_start
             .checked_add(old_size)
             .ok_or(WriterError::TooLarge)?;
-        let mut table_data = if old_count == 0 {
+        let mut table_data = if table_index == 4 {
+            Vec::with_capacity(export_indices.len() * EXPORT_SIZE)
+        } else if old_count == 0 {
             Vec::new()
         } else {
             template
@@ -1290,19 +1347,71 @@ fn build_prefix(
                     .ok_or(WriterError::TooLarge)?;
             }
         } else if table_index == 4 {
-            for export in new_exports {
-                let class_index = names
-                    .iter()
-                    .position(|name| name == &export.class_name)
-                    .and_then(|index| u16::try_from(index).ok())
-                    .ok_or_else(|| unsupported("new export class name index"))?;
-                table_data.extend_from_slice(&class_index.to_le_bytes());
-                table_data.extend_from_slice(&0_u16.to_le_bytes());
-                table_data.extend_from_slice(&0_u32.to_le_bytes());
-                table_data.extend_from_slice(&0_u32.to_le_bytes());
-                table_data.extend_from_slice(&0_u32.to_le_bytes());
-                table_data.extend_from_slice(&0_u32.to_le_bytes());
-                table_data.extend_from_slice(&0_u32.to_le_bytes());
+            let old_table =
+                usize::try_from(descriptor.offset).map_err(|_| WriterError::TooLarge)?;
+            for source_index in export_indices {
+                if let Some(export) = file.exports.get(*source_index) {
+                    let entry_start = old_table
+                        .checked_add(
+                            source_index
+                                .checked_mul(EXPORT_SIZE)
+                                .ok_or(WriterError::TooLarge)?,
+                        )
+                        .ok_or(WriterError::TooLarge)?;
+                    let entry_end = entry_start
+                        .checked_add(EXPORT_SIZE)
+                        .ok_or(WriterError::TooLarge)?;
+                    let mut entry = template
+                        .get(entry_start..entry_end)
+                        .ok_or_else(|| unsupported("template export table bounds"))?
+                        .to_vec();
+                    if export.parent_id != 0 {
+                        let parent_source = usize::try_from(export.parent_id - 1)
+                            .map_err(|_| WriterError::TooLarge)?;
+                        let parent_compact = export_remap
+                            .get(&parent_source)
+                            .copied()
+                            .ok_or_else(|| unsupported("retained export parent was pruned"))?;
+                        let parent_id = u32::try_from(
+                            parent_compact.checked_add(1).ok_or(WriterError::TooLarge)?,
+                        )
+                        .map_err(|_| WriterError::TooLarge)?;
+                        write_u32_at(&mut entry, 4, parent_id)?;
+                    }
+                    table_data.extend_from_slice(&entry);
+                } else {
+                    let export = &new_exports[*source_index - file.exports.len()];
+                    let class_index = names
+                        .iter()
+                        .position(|name| name == &export.class_name)
+                        .and_then(|index| u16::try_from(index).ok())
+                        .ok_or_else(|| unsupported("new export class name index"))?;
+                    table_data.extend_from_slice(&class_index.to_le_bytes());
+                    table_data.extend_from_slice(&0_u16.to_le_bytes());
+                    table_data.extend_from_slice(&0_u32.to_le_bytes());
+                    table_data.extend_from_slice(&0_u32.to_le_bytes());
+                    table_data.extend_from_slice(&0_u32.to_le_bytes());
+                    table_data.extend_from_slice(&0_u32.to_le_bytes());
+                    table_data.extend_from_slice(&0_u32.to_le_bytes());
+                }
+            }
+        } else if table_index == 6 {
+            for (embedded_index, embedded) in file.embedded.iter().enumerate() {
+                let chunk_source =
+                    usize::try_from(embedded.chunk_index).map_err(|_| WriterError::TooLarge)?;
+                let chunk_compact = export_remap
+                    .get(&chunk_source)
+                    .copied()
+                    .ok_or_else(|| unsupported("embedded file chunk was pruned"))?;
+                let offset = embedded_index
+                    .checked_mul(16)
+                    .and_then(|value| value.checked_add(4))
+                    .ok_or(WriterError::TooLarge)?;
+                write_u32_at(
+                    &mut table_data,
+                    offset,
+                    u32::try_from(chunk_compact).map_err(|_| WriterError::TooLarge)?,
+                )?;
             }
         }
 
@@ -1923,10 +2032,11 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        area_shape_outline_buffer, collect_handle_ids, encode_device_data_entry, handle_identity,
-        normalize_wolvenkit_enum_name, write_positive_vlq, write_with_template,
+        area_shape_outline_buffer, collect_handle_ids, compact_export_indices,
+        encode_device_data_entry, handle_identity, normalize_wolvenkit_enum_name,
+        write_positive_vlq, write_with_template,
     };
-    use crate::{codec, schema};
+    use crate::{codec, cr2w, schema};
     use serde_json::{Value, json};
     use std::{
         collections::{BTreeSet, HashMap, HashSet},
@@ -1990,6 +2100,16 @@ mod tests {
                 "mappin".to_owned()
             ])
         );
+    }
+
+    #[test]
+    fn compact_export_indices_preserves_order_and_maps_sparse_template_chunks() {
+        let chunks = HashMap::from([(0, &Value::Null), (8, &Value::Null), (3, &Value::Null)]);
+
+        let (indices, remap) = compact_export_indices(&chunks);
+
+        assert_eq!(indices, [0, 3, 8]);
+        assert_eq!(remap, HashMap::from([(0, 0), (3, 1), (8, 2)]));
     }
 
     #[test]
@@ -2102,6 +2222,44 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(replacement.as_str())
         );
+    }
+
+    #[test]
+    #[ignore = "real topology-shrink fixture; requires CR2W_PRUNE_JSON, CR2W_PRUNE_TEMPLATE, CR2W_PRUNE_EXPORTS, and RED_SCHEMA"]
+    fn serialized_cr2w_fixture_prunes_unreachable_exports() {
+        let json_path = env::var_os("CR2W_PRUNE_JSON").map(PathBuf::from).unwrap();
+        let fixture = env::var_os("CR2W_PRUNE_TEMPLATE")
+            .map(PathBuf::from)
+            .unwrap();
+        let expected_exports = env::var("CR2W_PRUNE_EXPORTS")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let schema_path = env::var_os("RED_SCHEMA").map(PathBuf::from).unwrap();
+        let classes: HashMap<String, schema::RedClass> =
+            serde_json::from_slice(&fs::read(schema_path).unwrap()).unwrap();
+        let class_names: BTreeSet<String> = classes.into_keys().collect();
+        let workspace = tempfile::tempdir().unwrap();
+        let output_path = workspace.path().join("pruned.cr2w");
+        let missing_dll = OsStr::new("missing-kraken.dll");
+
+        write_with_template(
+            &json_path,
+            &fixture,
+            &output_path,
+            &class_names,
+            missing_dll,
+        )
+        .unwrap();
+
+        let template_exports = cr2w::inspect(&fixture).unwrap().exports.len();
+        let output_exports = cr2w::inspect(&output_path).unwrap().exports.len();
+        assert!(
+            output_exports < template_exports,
+            "expected authored graph to prune template exports"
+        );
+        assert_eq!(output_exports, expected_exports);
+        codec::decode_wkit(&output_path, &class_names, missing_dll).unwrap();
     }
 
     #[test]
