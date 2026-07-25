@@ -324,10 +324,7 @@ impl Encoder<'_> {
             .filter(|end| *end <= self.template.len())
             .ok_or_else(|| unsupported("class template bounds"))?;
         if red_type == "AreaShapeOutline" {
-            return Ok((
-                self.template[template_start..template_end].to_vec(),
-                template_end,
-            ));
+            return Ok((area_shape_outline_buffer(value)?, template_end));
         }
         let object = value
             .as_object()
@@ -1101,6 +1098,14 @@ fn encode_device_data_entry(entry: &Value, class_name_index: u16) -> Result<Vec<
         );
     }
     Ok(output)
+}
+
+fn area_shape_outline_buffer(value: &Value) -> Result<Vec<u8>, WriterError> {
+    let buffer = value
+        .get("buffer")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unsupported("AreaShapeOutline.buffer"))?;
+    Ok(STANDARD.decode(buffer)?)
 }
 
 fn collect_new_exports<'a>(
@@ -1918,7 +1923,7 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_handle_ids, encode_device_data_entry, handle_identity,
+        area_shape_outline_buffer, collect_handle_ids, encode_device_data_entry, handle_identity,
         normalize_wolvenkit_enum_name, write_positive_vlq, write_with_template,
     };
     use crate::{codec, schema};
@@ -2035,6 +2040,13 @@ mod tests {
         assert!(
             (f32::from_le_bytes(encoded[36..40].try_into().unwrap()) - 5.174_843).abs() < 0.001
         );
+    }
+
+    #[test]
+    fn area_shape_outline_uses_authored_wolvenkit_buffer() {
+        let value = json!({"buffer": "AQIDBA=="});
+
+        assert_eq!(area_shape_outline_buffer(&value).unwrap(), [1, 2, 3, 4]);
     }
 
     #[test]
