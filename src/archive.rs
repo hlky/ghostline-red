@@ -478,6 +478,54 @@ pub fn extract_path(
     Ok(())
 }
 
+/// Extracts one entry from an already-read archive index into memory.
+///
+/// Reusing the index is materially faster when a caller needs a mesh and its
+/// complete material dependency graph from the same set of game archives.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] when `entry_index` is invalid, its segment range is
+/// malformed, the archive cannot be read, or decompression fails.
+pub fn extract_entry_bytes(
+    archive_path: &Path,
+    index: &ArchiveIndex,
+    entry_index: usize,
+    kraken_path: &OsStr,
+) -> Result<Vec<u8>, ArchiveError> {
+    let entry = index
+        .entries
+        .get(entry_index)
+        .ok_or(ArchiveError::InvalidIndex)?;
+    let start = usize::try_from(entry.segments_start).map_err(|_| ArchiveError::CountOverflow)?;
+    let end = usize::try_from(entry.segments_end).map_err(|_| ArchiveError::CountOverflow)?;
+    let selected = index
+        .segments
+        .get(start..end)
+        .ok_or(ArchiveError::InvalidSegmentRange {
+            entry: entry_index,
+            start: entry.segments_start,
+            end: entry.segments_end,
+        })?;
+    let capacity = selected
+        .iter()
+        .try_fold(0_usize, |total, segment| {
+            total.checked_add(usize::try_from(segment.size).ok()?)
+        })
+        .ok_or(ArchiveError::CountOverflow)?;
+    let mut archive = BufReader::new(File::open(archive_path)?);
+    let mut result = Vec::with_capacity(capacity);
+    for (segment_index, segment) in selected.iter().enumerate() {
+        result.extend(read_segment(
+            &mut archive,
+            *segment,
+            kraken_path,
+            segment_index == 0,
+        )?);
+    }
+    Ok(result)
+}
+
 fn collect_files(source: &Path) -> Result<Vec<(u64, String, PathBuf)>, ArchiveError> {
     let mut result = Vec::new();
     let mut pending = vec![source.to_path_buf()];

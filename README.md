@@ -51,6 +51,11 @@ stronger on general data.
 - Inspect CR2W headers and table descriptors.
 - Generate RED reflection metadata from a WolvenKit source checkout.
 - Convert reflected CR2W resources to and from WKit-shaped JSON.
+- Export `.mesh` geometry to GLB with position, normal, tangent, color, UV,
+  index, LOD, and appearance-material metadata.
+- Export a selected mesh appearance's material sidecar, textures, multilayer
+  setup/template JSON, and decoded multilayer masks directly from game
+  archives.
 - Decode and rebuild typed RedPackage buffers.
 - Grow CName/import tables and template-backed handle export arrays.
 - Isolate native Kraken work in short-lived worker processes.
@@ -210,6 +215,82 @@ compacted to match the rebuilt export table. Unreferenced imports are removed,
 with resource and embedded-file import indices remapped to the compact table.
 Entirely novel RED classes and RedPackage chunk-topology changes remain
 template-bound.
+
+## Mesh and material export
+
+Export native GLB geometry only:
+
+```powershell
+& $red mesh-export '.\extracted\item.mesh' `
+  --schema '.\red-schema.json' `
+  --output '.\item.glb'
+```
+
+Add a Blender-compatible material sidecar and uncooked dependency repository:
+
+```powershell
+& $red mesh-export '.\extracted\item.mesh' `
+  --schema '.\red-schema.json' `
+  --output '.\item.glb' `
+  --archives-root 'H:\Cyberpunk 2077\archive\pc' `
+  --material-repo '.\material-repo' `
+  --appearance 'denim_blue_red' `
+  --pbr --pbr-size 512
+```
+
+`--appearance` limits work to the materials used by that appearance. The
+repository is reusable: existing textures, mask lists, and recursive material
+documents are treated as a shared dependency cache. `--pbr` resolves the
+selected Cyberpunk materials into standard glTF base-color,
+metallic-roughness, normal, emissive, alpha, and transmission inputs. Baked
+textures are content-addressed under the material repository and reused by
+every later mesh that references the same material.
+
+The PBR path covers all material templates currently present in Ghostline's
+equipment catalog: multilayered, metal base (including glitter), mesh decal
+(including emissive and parallax), one- and two-sided glass, parallax screen,
+signage, and hologram. Unsupported or malformed records fail explicitly
+instead of silently producing an untextured material.
+
+For catalog-scale work, index the archives once and export every requested
+mesh appearance from a manifest:
+
+```json
+{
+  "jobs": [
+    {
+      "mesh": "base\\characters\\garment\\player_equipment\\feet\\item.mesh",
+      "appearance": "black_red",
+      "output": "C:\\catalog\\item-black-red.glb"
+    }
+  ]
+}
+```
+
+```powershell
+& $red mesh-export-batch '.\jobs.json' `
+  --schema '.\red-schema.json' `
+  --archives-root 'H:\Cyberpunk 2077\archive\pc' `
+  --material-repo '.\material-repo' `
+  --report '.\export-report.json' `
+  --pbr --pbr-size 512
+```
+
+The batch continues after individual failures and records each outcome in the
+report. Jobs run concurrently through a shared archive index. Use `--threads`
+to choose the worker count; zero (the default) uses every available logical
+CPU. Shared dependency and PBR-cache writes are locked per resource, so
+unrelated work remains parallel while duplicate material references are
+deduplicated safely.
+
+An already exported GLB and sidecar can be upgraded independently:
+
+```powershell
+& $red pbr-bake '.\item.glb' `
+  --sidecar '.\item.Material.json' `
+  --appearance 'denim_blue_red' `
+  --size 512
+```
 
 ## LXRS metadata
 

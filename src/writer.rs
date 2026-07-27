@@ -1814,6 +1814,24 @@ fn is_default_missing_value(value: &Value, red_type: &str) -> bool {
     {
         return true;
     }
+    if value.as_str() == Some("0")
+        && matches!(
+            red_type,
+            "Int8"
+                | "Uint8"
+                | "Int16"
+                | "Uint16"
+                | "Int32"
+                | "Uint32"
+                | "Int64"
+                | "Uint64"
+                | "Float"
+                | "Double"
+                | "CRUID"
+        )
+    {
+        return true;
+    }
     let stored = value.get("$value").and_then(Value::as_str);
     matches!(red_type, "NodeRef" | "TweakDBID" | "CName")
         && stored.is_some_and(|value| matches!(value, "" | "0" | "None"))
@@ -3309,6 +3327,10 @@ mod tests {
             &json!("default__false_"),
             "gameAlwaysSpawnedState"
         ));
+        assert!(is_default_missing_value(&json!("0"), "Uint64"));
+        assert!(is_default_missing_value(&json!("0"), "CRUID"));
+        assert!(!is_default_missing_value(&json!("1"), "Uint64"));
+        assert!(!is_default_missing_value(&json!("0"), "String"));
         assert!(!is_default_missing_value(&json!(1), "Bool"));
         assert!(!is_default_missing_value(
             &json!([{"$type": "CName", "$storage": "string", "$value": "custom"}]),

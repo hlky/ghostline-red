@@ -1,12 +1,38 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use ghostline_red::{archive, codec, cr2w, kraken, localization, schema, writer};
+use ghostline_red::{
+    archive, codec, cr2w, kraken, localization, material, mesh, pbr, schema, writer,
+};
+use rayon::{ThreadPoolBuilder, prelude::*};
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
+use tempfile::NamedTempFile;
+
+#[derive(Debug, Deserialize)]
+struct MeshExportBatchManifest {
+    jobs: Vec<MeshExportBatchJob>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MeshExportBatchJob {
+    mesh: String,
+    appearance: String,
+    output: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct MeshExportBatchOutcome {
+    mesh: String,
+    appearance: String,
+    output: PathBuf,
+    error: Option<String>,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
@@ -112,6 +138,68 @@ enum Command {
         #[arg(long)]
         template: PathBuf,
         output: PathBuf,
+    },
+    /// Export a Cyberpunk mesh to a WolvenKit-compatible binary glTF.
+    MeshExport {
+        input: PathBuf,
+        /// Schema sources in increasing precedence order.
+        #[arg(long, required = true)]
+        schema: Vec<PathBuf>,
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Include every LOD instead of only the first render LOD.
+        #[arg(long)]
+        all_lods: bool,
+        /// Index game archives and export the mesh's complete material dependency graph.
+        #[arg(long, requires = "material_repo")]
+        archives_root: Option<PathBuf>,
+        /// Destination for uncooked textures, masks, and material documents.
+        #[arg(long, requires = "archives_root")]
+        material_repo: Option<PathBuf>,
+        /// Export only the materials needed by this mesh appearance.
+        #[arg(long, requires = "archives_root")]
+        appearance: Option<String>,
+        /// Bake selected Cyberpunk materials to standard glTF PBR textures.
+        #[arg(long, requires = "appearance")]
+        pbr: bool,
+        /// Square resolution for generated PBR textures.
+        #[arg(long, default_value_t = 512)]
+        pbr_size: u32,
+    },
+    /// Export many archive-backed mesh appearances while indexing archives once.
+    MeshExportBatch {
+        manifest: PathBuf,
+        /// Schema sources in increasing precedence order.
+        #[arg(long, required = true)]
+        schema: Vec<PathBuf>,
+        /// Root containing the game's content, expansion, hotfix, and mod archives.
+        #[arg(long)]
+        archives_root: PathBuf,
+        /// Shared destination for decoded material dependencies.
+        #[arg(long)]
+        material_repo: PathBuf,
+        /// Machine-readable per-job outcome report.
+        #[arg(long)]
+        report: PathBuf,
+        /// Bake every selected material to standard glTF PBR textures.
+        #[arg(long)]
+        pbr: bool,
+        /// Square resolution for generated PBR textures.
+        #[arg(long, default_value_t = 512)]
+        pbr_size: u32,
+        /// Concurrent export jobs; zero uses all available logical CPUs.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
+    },
+    /// Attach standard glTF PBR materials to an existing exported mesh.
+    PbrBake {
+        glb: PathBuf,
+        #[arg(long)]
+        sidecar: PathBuf,
+        #[arg(long)]
+        appearance: String,
+        #[arg(long, default_value_t = 512)]
+        size: u32,
     },
     /// Generate compact RED class/property metadata from `WolvenKit` source.
     SchemaGenerate { wolvenkit: PathBuf, output: PathBuf },
@@ -313,6 +401,150 @@ fn main() -> Result<()> {
             output,
         } => {
             localization::write_from_json(&input, &template, &output)?;
+        }
+        Command::MeshExport {
+            input,
+            schema,
+            output,
+            all_lods,
+            archives_root,
+            material_repo,
+            appearance,
+            pbr,
+            pbr_size,
+        } => {
+            let schema = load_schemas(&schema)?;
+            mesh::export_glb(&input, &schema, &output, cli.kraken.as_os_str(), !all_lods)?;
+            if let (Some(archives_root), Some(material_repo)) = (archives_root, material_repo) {
+                let archives = material::ArchiveSet::open(&archives_root)?;
+                let sidecar = output.with_extension("Material.json");
+                let summary = material::export_mesh_materials(
+                    &input,
+                    &schema,
+                    &archives,
+                    &material_repo,
+                    &sidecar,
+                    cli.kraken.as_os_str(),
+                    appearance.as_deref(),
+                )?;
+                eprintln!(
+                    "{} materials, {} dependencies ({} textures, {} masks)",
+                    summary.materials, summary.dependencies, summary.textures, summary.masks
+                );
+                if pbr {
+                    let appearance = appearance
+                        .as_deref()
+                        .context("--pbr requires an explicit --appearance")?;
+                    let summary =
+                        pbr::bake_sidecar_into_glb(&sidecar, &output, appearance, Some(pbr_size))?;
+                    eprintln!(
+                        "{} PBR materials ({} generated textures, {} reused)",
+                        summary.materials, summary.generated_textures, summary.reused_textures
+                    );
+                }
+            }
+            println!("{}", output.display());
+        }
+        Command::MeshExportBatch {
+            manifest,
+            schema,
+            archives_root,
+            material_repo,
+            report,
+            pbr,
+            pbr_size,
+            threads,
+        } => {
+            let schema = load_schemas(&schema)?;
+            let manifest: MeshExportBatchManifest = serde_json::from_slice(&fs::read(&manifest)?)?;
+            let archives = material::ArchiveSet::open(&archives_root)?;
+            let job_count = manifest.jobs.len();
+            let thread_count = if threads == 0 {
+                std::thread::available_parallelism().map_or(1, usize::from)
+            } else {
+                threads
+            };
+            eprintln!("exporting {job_count} jobs with {thread_count} threads");
+            let pool = ThreadPoolBuilder::new().num_threads(thread_count).build()?;
+            let completed = AtomicUsize::new(0);
+            let outcomes = pool.install(|| {
+                manifest
+                    .jobs
+                    .into_par_iter()
+                    .map(|job| {
+                        let result = (|| -> Result<()> {
+                            let bytes =
+                                archives.read_resource(&job.mesh, cli.kraken.as_os_str())?;
+                            let mut input = NamedTempFile::new()?;
+                            input.write_all(&bytes)?;
+                            mesh::export_glb(
+                                input.path(),
+                                &schema,
+                                &job.output,
+                                cli.kraken.as_os_str(),
+                                true,
+                            )?;
+                            let sidecar = job.output.with_extension("Material.json");
+                            material::export_mesh_materials(
+                                input.path(),
+                                &schema,
+                                &archives,
+                                &material_repo,
+                                &sidecar,
+                                cli.kraken.as_os_str(),
+                                Some(&job.appearance),
+                            )?;
+                            if pbr {
+                                pbr::bake_sidecar_into_glb(
+                                    &sidecar,
+                                    &job.output,
+                                    &job.appearance,
+                                    Some(pbr_size),
+                                )?;
+                            }
+                            Ok(())
+                        })();
+                        let position = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprintln!("[{position}/{job_count}] {} ({})", job.mesh, job.appearance);
+                        MeshExportBatchOutcome {
+                            mesh: job.mesh,
+                            appearance: job.appearance,
+                            output: job.output,
+                            error: result.err().map(|error| format!("{error:#}")),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            if let Some(parent) = report.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&report, serde_json::to_vec_pretty(&outcomes)?)?;
+            let failures = outcomes
+                .iter()
+                .filter(|outcome| outcome.error.is_some())
+                .count();
+            println!(
+                "completed {} mesh exports with {failures} failures",
+                outcomes.len()
+            );
+            if failures > 0 {
+                anyhow::bail!(
+                    "{failures} mesh export jobs failed; see {}",
+                    report.display()
+                );
+            }
+        }
+        Command::PbrBake {
+            glb,
+            sidecar,
+            appearance,
+            size,
+        } => {
+            let summary = pbr::bake_sidecar_into_glb(&sidecar, &glb, &appearance, Some(size))?;
+            println!(
+                "{} PBR materials ({} generated textures, {} reused)",
+                summary.materials, summary.generated_textures, summary.reused_textures
+            );
         }
         Command::SchemaGenerate { wolvenkit, output } => {
             let count = schema::generate(&wolvenkit, &output)?;
