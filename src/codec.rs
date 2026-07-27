@@ -4,11 +4,12 @@ use crate::{
     archive::{self, ArchiveError},
     cr2w::{self, Cr2wError, Cr2wInspection},
     redpackage::{self, PackageError, PackageSettings},
+    schema::{RedClass, RedSchema},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde_json::{Map, Value, json};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::OsStr,
     fmt::Write as _,
     fs, io,
@@ -36,6 +37,8 @@ struct Decoder<'a> {
     bytes: &'a [u8],
     file: &'a Cr2wInspection,
     classes: &'a BTreeSet<String>,
+    enums: Option<&'a BTreeSet<String>>,
+    bitfields: Option<&'a BTreeSet<String>>,
     kraken_path: &'a OsStr,
 }
 
@@ -50,12 +53,44 @@ pub fn decode_exports(
     classes: &BTreeSet<String>,
     kraken_path: &OsStr,
 ) -> Result<Value, CodecError> {
+    decode_exports_inner(path, classes, None, None, kraken_path)
+}
+
+/// Decodes reflected exports using official enum and bitfield categories.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] under the same conditions as [`decode_exports`].
+pub fn decode_exports_with_red_schema(
+    path: &Path,
+    schema: &RedSchema,
+    kraken_path: &OsStr,
+) -> Result<Value, CodecError> {
+    let classes = schema.class_names();
+    decode_exports_inner(
+        path,
+        &classes,
+        Some(&schema.enums),
+        Some(&schema.bitfields),
+        kraken_path,
+    )
+}
+
+fn decode_exports_inner(
+    path: &Path,
+    classes: &BTreeSet<String>,
+    enums: Option<&BTreeSet<String>>,
+    bitfields: Option<&BTreeSet<String>>,
+    kraken_path: &OsStr,
+) -> Result<Value, CodecError> {
     let file = cr2w::inspect(path)?;
     let bytes = fs::read(path)?;
     let decoder = Decoder {
         bytes: &bytes,
         file: &file,
         classes,
+        enums,
+        bitfields,
         kraken_path,
     };
     let exports = file
@@ -86,26 +121,73 @@ pub fn decode_wkit(
     classes: &BTreeSet<String>,
     kraken_path: &OsStr,
 ) -> Result<Value, CodecError> {
-    let flat = decode_exports(path, classes, kraken_path)?;
-    let exports = flat
-        .get("exports")
-        .and_then(Value::as_array)
+    decode_wkit_inner(path, classes, None, None, kraken_path, None)
+}
+
+/// Decodes a CR2W file using schema property order to reproduce `WolvenKit`
+/// handle identity assignment.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] under the same conditions as [`decode_wkit`].
+pub fn decode_wkit_with_schema(
+    path: &Path,
+    classes: &BTreeMap<String, RedClass>,
+    kraken_path: &OsStr,
+) -> Result<Value, CodecError> {
+    let class_names = classes.keys().cloned().collect();
+    decode_wkit_inner(path, &class_names, None, None, kraken_path, Some(classes))
+}
+
+/// Decodes CR2W using official `REDmod` RTTI categories and property order.
+///
+/// # Errors
+///
+/// Returns [`CodecError`] under the same conditions as [`decode_wkit`].
+pub fn decode_wkit_with_red_schema(
+    path: &Path,
+    schema: &RedSchema,
+    kraken_path: &OsStr,
+) -> Result<Value, CodecError> {
+    let class_names = schema.class_names();
+    decode_wkit_inner(
+        path,
+        &class_names,
+        Some(&schema.enums),
+        Some(&schema.bitfields),
+        kraken_path,
+        Some(&schema.classes),
+    )
+}
+
+fn decode_wkit_inner(
+    path: &Path,
+    classes: &BTreeSet<String>,
+    enums: Option<&BTreeSet<String>>,
+    bitfields: Option<&BTreeSet<String>>,
+    kraken_path: &OsStr,
+    schema: Option<&BTreeMap<String, RedClass>>,
+) -> Result<Value, CodecError> {
+    let mut flat = decode_exports_inner(path, classes, enums, bitfields, kraken_path)?;
+    let wrapped_exports = flat
+        .get_mut("exports")
+        .and_then(Value::as_array_mut)
+        .map(std::mem::take)
         .ok_or_else(|| malformed(0, "exports"))?
-        .iter()
-        .map(|export| {
+        .into_iter();
+    let exports = wrapped_exports
+        .map(|mut export| {
             export
-                .get("value")
-                .cloned()
+                .as_object_mut()
+                .and_then(|object| object.remove("value"))
                 .ok_or_else(|| malformed(0, "export value"))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let root = exports
-        .first()
-        .cloned()
-        .ok_or_else(|| malformed(0, "root export"))?;
-    let mut visited = HashSet::new();
-    let root = expand_handles(root, &exports, &mut visited)?;
     let inspection = cr2w::inspect(path)?;
+    let handle_ids = reachable_handle_ids(&exports, &inspection, schema)?;
+    let root = exports.first().ok_or_else(|| malformed(0, "root export"))?;
+    let mut visited = HashSet::new();
+    let root = expand_handles(root, &exports, &handle_ids, &mut visited)?;
     let embedded = inspection
         .embedded
         .iter()
@@ -113,7 +195,6 @@ pub fn decode_wkit(
             let chunk = usize::try_from(item.chunk_index)
                 .ok()
                 .and_then(|index| exports.get(index))
-                .cloned()
                 .ok_or_else(|| malformed(0, "embedded chunk"))?;
             Ok(json!({
                 "FileName": {
@@ -121,10 +202,11 @@ pub fn decode_wkit(
                     "$storage": "string",
                     "$value": item.depot_path
                 },
-                "Content": expand_handles(chunk, &exports, &mut visited)?
+                "Content": expand_handles(chunk, &exports, &handle_ids, &mut visited)?
             }))
         })
         .collect::<Result<Vec<_>, CodecError>>()?;
+    drop_values(exports);
     let mut data = json!({
         "Version": inspection.header.version,
         "BuildVersion": inspection.header.build_version,
@@ -138,7 +220,7 @@ pub fn decode_wkit(
     }
     Ok(json!({
         "Header": {
-            "WolvenKitVersion": "ghostline-red 0.1.0",
+            "WolvenKitVersion": env!("CARGO_PKG_VERSION"),
             "WKitJsonVersion": "0.0.9",
             "GameVersion": 2310,
             "ExportedDateTime": "1970-01-01T00:00:00Z",
@@ -150,50 +232,191 @@ pub fn decode_wkit(
 }
 
 fn expand_handles(
-    value: Value,
+    value: &Value,
     exports: &[Value],
+    handle_ids: &HashMap<usize, usize>,
     visited: &mut HashSet<usize>,
 ) -> Result<Value, CodecError> {
-    match value {
-        Value::Array(values) => values
-            .into_iter()
-            .map(|value| expand_handles(value, exports, visited))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array),
-        Value::Object(mut object) if object.len() == 1 && object.contains_key("$handle") => {
-            let index = object
-                .remove("$handle")
-                .and_then(|value| value.as_u64())
-                .and_then(|value| usize::try_from(value).ok())
-                .ok_or_else(|| malformed(0, "handle index"))?;
-            if index == usize::try_from(u32::MAX).expect("u32 always fits in usize") {
-                return Ok(Value::Null);
-            }
-            if !visited.insert(index) {
-                let handle_id = index
-                    .checked_sub(1)
-                    .ok_or_else(|| malformed(0, "root handle reference"))?;
-                return Ok(json!({"HandleRefId": handle_id.to_string()}));
-            }
-            let data = exports
-                .get(index)
-                .cloned()
-                .ok_or_else(|| malformed(0, "handle export"))?;
-            let handle_id = index
-                .checked_sub(1)
-                .ok_or_else(|| malformed(0, "root handle"))?;
-            Ok(json!({
-                "HandleId": handle_id.to_string(),
-                "Data": expand_handles(data, exports, visited)?
-            }))
-        }
-        Value::Object(object) => object
-            .into_iter()
-            .map(|(key, value)| Ok((key, expand_handles(value, exports, visited)?)))
-            .collect::<Result<Map<_, _>, CodecError>>()
-            .map(Value::Object),
-        scalar => Ok(scalar),
+    enum Work<'a> {
+        Visit(&'a Value),
+        FinishArray(usize),
+        FinishObject(Vec<String>),
+        FinishHandle(usize),
     }
+
+    let mut pending = vec![Work::Visit(value)];
+    let mut completed = Vec::new();
+    while let Some(work) = pending.pop() {
+        match work {
+            Work::Visit(Value::Array(values)) => {
+                pending.push(Work::FinishArray(values.len()));
+                pending.extend(values.iter().rev().map(Work::Visit));
+            }
+            Work::Visit(Value::Object(object))
+                if object.len() == 1 && object.contains_key("$handle") =>
+            {
+                let index = object
+                    .get("$handle")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| malformed(0, "handle index"))?;
+                if index == usize::try_from(u32::MAX).expect("u32 always fits in usize") {
+                    completed.push(Value::Null);
+                    continue;
+                }
+                let handle_id = handle_ids
+                    .get(&index)
+                    .copied()
+                    .ok_or_else(|| malformed(0, "unreachable handle"))?;
+                if visited.insert(index) {
+                    let data = exports
+                        .get(index)
+                        .ok_or_else(|| malformed(0, "handle export"))?;
+                    pending.push(Work::FinishHandle(handle_id));
+                    pending.push(Work::Visit(data));
+                } else {
+                    completed.push(json!({"HandleRefId": handle_id.to_string()}));
+                }
+            }
+            Work::Visit(Value::Object(object)) => {
+                pending.push(Work::FinishObject(object.keys().cloned().collect()));
+                pending.extend(object.values().rev().map(Work::Visit));
+            }
+            Work::Visit(scalar) => completed.push(scalar.clone()),
+            Work::FinishArray(length) => {
+                let start = completed
+                    .len()
+                    .checked_sub(length)
+                    .ok_or_else(|| malformed(0, "array expansion"))?;
+                let values = completed.drain(start..).collect();
+                completed.push(Value::Array(values));
+            }
+            Work::FinishObject(keys) => {
+                let start = completed
+                    .len()
+                    .checked_sub(keys.len())
+                    .ok_or_else(|| malformed(0, "object expansion"))?;
+                let values = completed.drain(start..).collect::<Vec<_>>();
+                completed.push(Value::Object(keys.into_iter().zip(values).collect()));
+            }
+            Work::FinishHandle(handle_id) => {
+                let data = completed
+                    .pop()
+                    .ok_or_else(|| malformed(0, "handle expansion"))?;
+                completed.push(json!({
+                    "HandleId": handle_id.to_string(),
+                    "Data": data
+                }));
+            }
+        }
+    }
+    completed
+        .pop()
+        .filter(|_| completed.is_empty())
+        .ok_or_else(|| malformed(0, "value expansion"))
+}
+
+fn drop_values(values: Vec<Value>) {
+    let mut pending = values;
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(values) => pending.extend(values),
+            Value::Object(values) => pending.extend(values.into_values()),
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+}
+
+fn reachable_handle_ids(
+    exports: &[Value],
+    inspection: &Cr2wInspection,
+    schema: Option<&BTreeMap<String, RedClass>>,
+) -> Result<HashMap<usize, usize>, CodecError> {
+    let root = exports.first().ok_or_else(|| malformed(0, "root export"))?;
+    let mut pending = Vec::new();
+    for embedded in inspection.embedded.iter().rev() {
+        let index =
+            usize::try_from(embedded.chunk_index).map_err(|_| malformed(0, "embedded chunk"))?;
+        pending.push(
+            exports
+                .get(index)
+                .ok_or_else(|| malformed(0, "embedded chunk"))?,
+        );
+    }
+    pending.push(root);
+    let mut handle_ids = HashMap::new();
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Array(values) => pending.extend(values.iter().rev()),
+            Value::Object(object) if object.len() == 1 && object.contains_key("$handle") => {
+                let index = object
+                    .get("$handle")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| malformed(0, "handle index"))?;
+                if index == usize::try_from(u32::MAX).expect("u32 always fits in usize") {
+                    continue;
+                }
+                if !handle_ids.contains_key(&index) {
+                    handle_ids.insert(index, handle_ids.len());
+                    pending.push(
+                        exports
+                            .get(index)
+                            .ok_or_else(|| malformed(0, "handle export"))?,
+                    );
+                }
+            }
+            Value::Object(object) => {
+                pending.extend(ordered_object_values(object, schema).into_iter().rev());
+            }
+            _ => {}
+        }
+    }
+    Ok(handle_ids)
+}
+
+fn ordered_object_values<'a>(
+    object: &'a Map<String, Value>,
+    schema: Option<&BTreeMap<String, RedClass>>,
+) -> Vec<&'a Value> {
+    let Some(schema) = schema else {
+        return object.values().collect();
+    };
+    let Some(class_name) = object.get("$type").and_then(Value::as_str) else {
+        return object.values().collect();
+    };
+    let mut properties = Vec::new();
+    let mut pending = vec![class_name];
+    let mut visited = HashSet::new();
+    while let Some(class_name) = pending.pop() {
+        if !visited.insert(class_name) {
+            continue;
+        }
+        let Some(class) = schema.get(class_name) else {
+            continue;
+        };
+        properties.extend(class.properties.keys().map(String::as_str));
+        if let Some(base) = class.base.as_deref() {
+            pending.push(base);
+        }
+    }
+    properties.sort_unstable();
+    let mut seen = HashSet::new();
+    let mut values = Vec::with_capacity(object.len());
+    for name in properties {
+        if seen.insert(name)
+            && let Some(value) = object.get(name)
+        {
+            values.push(value);
+        }
+    }
+    values.extend(
+        object
+            .iter()
+            .filter(|(name, _)| name.as_str() != "$type" && !seen.contains(name.as_str()))
+            .map(|(_, value)| value),
+    );
+    values
 }
 
 impl Decoder<'_> {
@@ -215,6 +438,9 @@ impl Decoder<'_> {
                 }),
                 end,
             ));
+        }
+        if is_opaque_custom_data(red_type) {
+            return Ok(self.read_opaque_custom_data(red_type, start, end));
         }
         let mut cursor = start;
         if self.byte(cursor)? != 0 {
@@ -295,7 +521,35 @@ impl Decoder<'_> {
             "worldStreamingWorld" => end,
             _ => cursor,
         };
+        cursor = self.read_opaque_appendix(red_type, cursor, end, &mut object);
         Ok((Value::Object(object), cursor))
+    }
+
+    fn read_opaque_appendix(
+        &self,
+        red_type: &str,
+        cursor: usize,
+        end: usize,
+        object: &mut Map<String, Value>,
+    ) -> usize {
+        if cursor >= end || !is_opaque_appendix(red_type) {
+            return cursor;
+        }
+        object.insert(
+            "$rawTail".to_owned(),
+            Value::String(STANDARD.encode(&self.bytes[cursor..end])),
+        );
+        end
+    }
+
+    fn read_opaque_custom_data(&self, red_type: &str, start: usize, end: usize) -> (Value, usize) {
+        (
+            json!({
+                "$type": red_type,
+                "$rawData": STANDARD.encode(&self.bytes[start..end])
+            }),
+            end,
+        )
     }
 
     fn read_streaming_sector_appendix(
@@ -492,15 +746,35 @@ impl Decoder<'_> {
                     consumed,
                 ))
             }
-            "DataBuffer" => exact(self.data_buffer(self.u32(start)?, start, end)?),
+            "SharedDataBuffer" => {
+                let length = usize::try_from(self.u32(start)?)
+                    .map_err(|_| malformed(start, "shared buffer length"))?;
+                let payload_end = start
+                    .checked_add(4)
+                    .and_then(|start| start.checked_add(length))
+                    .filter(|payload_end| *payload_end <= end)
+                    .ok_or_else(|| malformed(start, "shared buffer bounds"))?;
+                Ok((
+                    json!({
+                        "Flags": 0,
+                        "Bytes": STANDARD.encode(&self.bytes[start + 4..payload_end])
+                    }),
+                    payload_end,
+                ))
+            }
+            "DataBuffer" => self.data_buffer(self.u32(start)?, start, end),
             "serializationDeferredDataBuffer" => {
                 let encoded = self.u16(start)?;
-                let pointer = encoded
-                    .checked_sub(1)
-                    .ok_or_else(|| malformed(start, "deferred buffer pointer"))?;
-                exact(self.table_buffer(usize::from(pointer), start)?)
+                if encoded == 0 {
+                    exact(json!({"BufferId": "-1", "Flags": 0, "Bytes": ""}))
+                } else {
+                    exact(self.table_buffer(usize::from(encoded - 1), start)?)
+                }
             }
             "CGUID" => exact(json!({"$type": "CGUID", "$bytes": hex(&self.bytes[start..end])})),
+            _ if is_opaque_custom_data(red_type) => {
+                Ok(self.read_opaque_custom_data(red_type, start, end))
+            }
             _ if red_type.starts_with("array:") => {
                 self.read_counted_array(&red_type[6..], start, size, None)
             }
@@ -509,8 +783,26 @@ impl Decoder<'_> {
                     split_count_type(&red_type[7..]).ok_or_else(|| unsupported(red_type))?;
                 self.read_counted_array(inner, start, size, Some(count))
             }
+            _ if red_type.starts_with('[') => {
+                let (count, inner) =
+                    split_fixed_array_type(red_type).ok_or_else(|| unsupported(red_type))?;
+                let (elements, consumed) =
+                    self.read_counted_array(inner, start, size, Some(count))?;
+                Ok((json!({"Elements": elements}), consumed))
+            }
+            _ if red_type.starts_with("curveData:") => {
+                self.read_legacy_curve(&red_type[10..], start, size)
+            }
+            _ if red_type.starts_with("multiChannelCurve:") => {
+                self.read_multi_channel_curve(start, size)
+            }
             _ if red_type.starts_with("handle:") || red_type.starts_with("whandle:") => {
-                exact(json!({"$handle": self.u32(start)?.wrapping_sub(1)}))
+                let stored = self.u32(start)?;
+                exact(if stored == 0 {
+                    Value::Null
+                } else {
+                    json!({"$handle": stored - 1})
+                })
             }
             _ if red_type.starts_with("rRef:") || red_type.starts_with("raRef:") => {
                 let index = usize::from(self.u16(start)?);
@@ -533,6 +825,20 @@ impl Decoder<'_> {
                     "Flags": flags
                 }))
             }
+            _ if self.enums.is_some_and(|enums| enums.contains(red_type)) => {
+                if size != 2 {
+                    return Err(malformed(start, "enum size"));
+                }
+                exact(Value::String(
+                    self.name(usize::from(self.u16(start)?), start)?.to_owned(),
+                ))
+            }
+            _ if self
+                .bitfields
+                .is_some_and(|bitfields| bitfields.contains(red_type)) =>
+            {
+                self.read_bitfield(start, end)
+            }
             _ if self.classes.contains(red_type) => self.read_class(red_type, start, size),
             _ if size == 2 => exact(Value::String(
                 self.name(usize::from(self.u16(start)?), start)?.to_owned(),
@@ -550,8 +856,36 @@ impl Decoder<'_> {
                 }
                 exact(Value::String(values.join(", ")))
             }
-            _ => Err(unsupported(red_type)),
+            _ => Err(unsupported(&format!("{red_type} ({size} bytes)"))),
         }
+    }
+
+    fn read_bitfield(&self, start: usize, end: usize) -> Result<(Value, usize), CodecError> {
+        if !(end - start).is_multiple_of(2) {
+            return Err(malformed(start, "bitfield size"));
+        }
+        let mut cursor = start;
+        let mut values = Vec::new();
+        while cursor < end {
+            let index = usize::from(self.u16(cursor)?);
+            cursor += 2;
+            if index == 0 {
+                return (cursor == end)
+                    .then(|| {
+                        (
+                            Value::String(if values.is_empty() {
+                                "0".to_owned()
+                            } else {
+                                values.join(", ")
+                            }),
+                            end,
+                        )
+                    })
+                    .ok_or_else(|| malformed(cursor, "bitfield trailing bytes"));
+            }
+            values.push(self.name(index, cursor)?.to_owned());
+        }
+        Err(malformed(cursor, "bitfield terminator"))
     }
 
     fn read_counted_array(
@@ -570,7 +904,13 @@ impl Decoder<'_> {
         let mut cursor = start + 4;
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
-            let element_size = fixed_size(inner).unwrap_or(end.saturating_sub(cursor));
+            let element_size = fixed_size(inner).unwrap_or_else(|| {
+                if self.classes.contains(inner) || is_variable_size(inner) {
+                    end.saturating_sub(cursor)
+                } else {
+                    2
+                }
+            });
             let (value, consumed) = self.read_value(inner, cursor, element_size)?;
             if consumed <= cursor || consumed > end {
                 return Err(malformed(cursor, "array element bounds"));
@@ -578,10 +918,159 @@ impl Decoder<'_> {
             values.push(value);
             cursor = consumed;
         }
-        if cursor != end {
-            return Err(malformed(cursor, "array trailing bytes"));
-        }
         Ok((Value::Array(values), cursor))
+    }
+
+    fn read_legacy_curve(
+        &self,
+        inner: &str,
+        start: usize,
+        size: usize,
+    ) -> Result<(Value, usize), CodecError> {
+        let limit = start
+            .checked_add(size)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| malformed(start, "curve bounds"))?;
+        let count =
+            usize::try_from(self.u32(start)?).map_err(|_| malformed(start, "curve count"))?;
+        let mut cursor = start + 4;
+        let mut elements = Vec::with_capacity(count);
+        for _ in 0..count {
+            let point = f32::from_bits(self.u32(cursor)?);
+            cursor += 4;
+            let (value, consumed) = if fixed_curve_class_size(inner).is_some() {
+                self.read_fixed_curve_class(inner, cursor, limit)?
+                    .ok_or_else(|| malformed(cursor, "fixed curve class type"))?
+            } else {
+                let element_size = fixed_size(inner).unwrap_or(limit.saturating_sub(cursor));
+                self.read_value(inner, cursor, element_size)?
+            };
+            if consumed <= cursor || consumed > limit {
+                return Err(malformed(cursor, "curve element bounds"));
+            }
+            elements.push(json!({"Point": point, "Value": value}));
+            cursor = consumed;
+        }
+        let end = cursor
+            .checked_add(2)
+            .filter(|end| *end <= limit)
+            .ok_or_else(|| malformed(cursor, "curve trailing fields"))?;
+        let interpolation = interpolation_type(self.byte(cursor)?)
+            .ok_or_else(|| malformed(cursor, "curve interpolation type"))?;
+        let link = segment_link_type(self.byte(cursor + 1)?)
+            .ok_or_else(|| malformed(cursor + 1, "curve link type"))?;
+        Ok((
+            json!({
+                "InterpolationType": interpolation,
+                "LinkType": link,
+                "Elements": elements
+            }),
+            end,
+        ))
+    }
+
+    fn read_fixed_curve_class(
+        &self,
+        red_type: &str,
+        start: usize,
+        limit: usize,
+    ) -> Result<Option<(Value, usize)>, CodecError> {
+        let floats = |count: usize| -> Result<Vec<f32>, CodecError> {
+            let end = start
+                .checked_add(count * 4)
+                .filter(|end| *end <= limit)
+                .ok_or_else(|| malformed(start, "fixed curve class bounds"))?;
+            (start..end)
+                .step_by(4)
+                .map(|offset| self.u32(offset).map(f32::from_bits))
+                .collect()
+        };
+        match red_type {
+            "Vector2" => {
+                let values = floats(2)?;
+                Ok(Some((
+                    json!({
+                        "$type": "Vector2",
+                        "X": values[0],
+                        "Y": values[1]
+                    }),
+                    start + 8,
+                )))
+            }
+            "Vector3" => {
+                let values = floats(3)?;
+                Ok(Some((
+                    json!({
+                        "$type": "Vector3",
+                        "X": values[0],
+                        "Y": values[1],
+                        "Z": values[2]
+                    }),
+                    start + 12,
+                )))
+            }
+            "Vector4" => {
+                let values = floats(4)?;
+                Ok(Some((
+                    json!({
+                        "$type": "Vector4",
+                        "W": values[3],
+                        "X": values[0],
+                        "Y": values[1],
+                        "Z": values[2]
+                    }),
+                    start + 16,
+                )))
+            }
+            "HDRColor" => {
+                let values = floats(4)?;
+                Ok(Some((
+                    json!({
+                        "$type": "HDRColor",
+                        "Alpha": values[3],
+                        "Blue": values[2],
+                        "Green": values[1],
+                        "Red": values[0]
+                    }),
+                    start + 16,
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn read_multi_channel_curve(
+        &self,
+        start: usize,
+        size: usize,
+    ) -> Result<(Value, usize), CodecError> {
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(|| malformed(start, "multi-channel curve bounds"))?;
+        let num_channels = self.u32(start)?;
+        let interpolation = interpolation_type(self.byte(start + 4)?)
+            .ok_or_else(|| malformed(start + 4, "curve interpolation type"))?;
+        let link = channel_link_type(self.byte(start + 5)?)
+            .ok_or_else(|| malformed(start + 5, "curve channel link type"))?;
+        let alignment = self.u32(start + 6)?;
+        let data_size = usize::try_from(self.u32(start + 10)?)
+            .map_err(|_| malformed(start + 10, "multi-channel curve data size"))?;
+        let data_start = start + 14;
+        let data_end = data_start
+            .checked_add(data_size)
+            .filter(|data_end| *data_end == end)
+            .ok_or_else(|| malformed(data_start, "multi-channel curve data bounds"))?;
+        Ok((
+            json!({
+                "NumChannels": num_channels,
+                "InterpolationType": interpolation,
+                "LinkType": link,
+                "Alignment": alignment,
+                "Data": STANDARD.encode(&self.bytes[data_start..data_end])
+            }),
+            end,
+        ))
     }
 
     fn string(&self, start: usize) -> Result<(String, usize), CodecError> {
@@ -659,14 +1148,22 @@ impl Decoder<'_> {
             .ok_or_else(|| malformed(offset, "name index"))
     }
 
-    fn data_buffer(&self, encoded: u32, start: usize, end: usize) -> Result<Value, CodecError> {
+    fn data_buffer(
+        &self,
+        encoded: u32,
+        start: usize,
+        end: usize,
+    ) -> Result<(Value, usize), CodecError> {
         if encoded == 0x8000_0000 {
-            return Ok(json!({"BufferId": "-1", "Flags": 0, "Bytes": ""}));
+            return Ok((
+                json!({"BufferId": "-1", "Flags": 0, "Bytes": ""}),
+                start + 4,
+            ));
         }
         if encoded > 0x8000_0000 {
             let pointer = usize::try_from((encoded ^ 0x8000_0000) - 1)
                 .map_err(|_| malformed(start, "buffer pointer"))?;
-            return self.table_buffer(pointer, start);
+            return Ok((self.table_buffer(pointer, start)?, start + 4));
         }
         let length =
             usize::try_from(encoded).map_err(|_| malformed(start, "inline buffer length"))?;
@@ -675,11 +1172,14 @@ impl Decoder<'_> {
             .and_then(|value| value.checked_add(length))
             .filter(|value| *value <= end)
             .ok_or_else(|| malformed(start, "inline buffer bounds"))?;
-        Ok(json!({
-            "BufferId": "-1",
-            "Flags": 0,
-            "Bytes": STANDARD.encode(&self.bytes[start + 4..payload_end])
-        }))
+        Ok((
+            json!({
+                "BufferId": "-1",
+                "Flags": 0,
+                "Bytes": STANDARD.encode(&self.bytes[start + 4..payload_end])
+            }),
+            payload_end,
+        ))
     }
 
     fn table_buffer(&self, index: usize, offset: usize) -> Result<Value, CodecError> {
@@ -714,14 +1214,20 @@ impl Decoder<'_> {
             .len()
             .checked_add(index.saturating_mul(65_536))
             .ok_or_else(|| malformed(offset, "RedPackage handle ID base"))?;
-        let data = redpackage::decode(
+        let Ok(data) = redpackage::decode(
             &bytes,
             self.classes,
             PackageSettings {
                 imports_as_hash,
                 handle_id_base,
             },
-        )?;
+        ) else {
+            return Ok(json!({
+                "BufferId": index.to_string(),
+                "Flags": buffer.flags,
+                "Bytes": STANDARD.encode(&bytes)
+            }));
+        };
         Ok(json!({
             "BufferId": index.to_string(),
             "Flags": buffer.flags,
@@ -812,28 +1318,28 @@ impl Decoder<'_> {
             .filter(|end| *end <= self.bytes.len())
             .ok_or_else(|| malformed(start, "buffer bounds"))?;
         let stored = &self.bytes[start..end];
-        let (bytes, is_stored) =
-            if buffer.disk_size != buffer.memory_size && stored.get(..4) == Some(b"KARK") {
-                let declared = u32::from_le_bytes(
-                    stored[4..8]
-                        .try_into()
-                        .map_err(|_| malformed(start, "KARK header"))?,
-                );
-                if declared != buffer.memory_size {
-                    return Err(malformed(start, "KARK memory size"));
-                }
-                match archive::decompress_payload_isolated(
-                    &stored[8..],
-                    usize::try_from(declared).map_err(|_| malformed(start, "KARK size"))?,
-                    self.kraken_path,
-                ) {
-                    Ok(bytes) => (bytes, false),
-                    Err(_) if allow_stored_fallback => (stored.to_vec(), true),
-                    Err(error) => return Err(error.into()),
-                }
-            } else {
-                (stored.to_vec(), false)
-            };
+        let (bytes, is_stored) = if stored.get(..4) == Some(b"KARK") {
+            let declared = u32::from_le_bytes(
+                stored
+                    .get(4..8)
+                    .ok_or_else(|| malformed(start, "KARK header"))?
+                    .try_into()
+                    .map_err(|_| malformed(start, "KARK header"))?,
+            );
+            match archive::decompress_payload_isolated(
+                stored
+                    .get(8..)
+                    .ok_or_else(|| malformed(start, "KARK payload"))?,
+                usize::try_from(declared).map_err(|_| malformed(start, "KARK size"))?,
+                self.kraken_path,
+            ) {
+                Ok(bytes) => (bytes, false),
+                Err(_) if allow_stored_fallback => (stored.to_vec(), true),
+                Err(error) => return Err(error.into()),
+            }
+        } else {
+            (stored.to_vec(), false)
+        };
         Ok((buffer, bytes, is_stored))
     }
 
@@ -868,7 +1374,7 @@ impl Decoder<'_> {
 fn fixed_size(red_type: &str) -> Option<usize> {
     match red_type {
         "Bool" | "Int8" | "Uint8" => Some(1),
-        "Int16" | "Uint16" | "CName" => Some(2),
+        "Int16" | "Uint16" | "CName" | "serializationDeferredDataBuffer" => Some(2),
         "Int32" | "Uint32" | "Float" => Some(4),
         "Int64"
         | "Uint64"
@@ -882,6 +1388,17 @@ fn fixed_size(red_type: &str) -> Option<usize> {
         value if value.starts_with("rRef:") || value.starts_with("raRef:") => Some(2),
         _ => None,
     }
+}
+
+fn is_variable_size(red_type: &str) -> bool {
+    matches!(
+        red_type,
+        "String" | "NodeRef" | "LocalizationString" | "DataBuffer" | "SharedDataBuffer"
+    ) || red_type.starts_with("array:")
+        || red_type.starts_with("static:")
+        || red_type.starts_with('[')
+        || red_type.starts_with("curveData:")
+        || red_type.starts_with("multiChannelCurve:")
 }
 
 fn is_redpackage_property(class_name: &str, property_name: &str) -> bool {
@@ -898,9 +1415,84 @@ fn is_redpackage_property(class_name: &str, property_name: &str) -> bool {
     )
 }
 
+fn is_opaque_custom_data(red_type: &str) -> bool {
+    matches!(
+        red_type,
+        "Variant"
+            | "AITrafficWorkspotCompiled"
+            | "animAnimationBufferCompressed"
+            | "gameCompiledSmartObjectData"
+            | "gameSmartObjectAnimationDatabase"
+            | "worldCompiledEffectInfo"
+    )
+}
+
+fn is_opaque_appendix(red_type: &str) -> bool {
+    matches!(
+        red_type,
+        "animRig"
+            | "C2dArray"
+            | "CMaterialTemplate"
+            | "CPhysicsDecorationResource"
+            | "gameLocationResource"
+            | "gameLootResourceData"
+            | "meshMeshParamSpeedTreeWind"
+            | "physicsColliderMesh"
+            | "physicsMaterialLibraryResource"
+            | "scnAnimName"
+            | "worldInstancedMeshNode"
+            | "worldInstancedOccluderNode"
+            | "worldTrafficCompiledNode"
+            | "worldTrafficLanesSpotsResource"
+            | "worldTrafficPersistentLaneConnectionsResource"
+            | "worldTrafficPersistentLanePolygonResource"
+            | "worldTrafficPersistentResource"
+            | "worldTrafficPersistentSpatialResource"
+    )
+}
+
 fn split_count_type(value: &str) -> Option<(usize, &str)> {
     let (count, inner) = value.split_once(',')?;
     Some((count.parse().ok()?, inner))
+}
+
+fn split_fixed_array_type(value: &str) -> Option<(usize, &str)> {
+    let value = value.strip_prefix('[')?;
+    let (count, inner) = value.split_once(']')?;
+    (!inner.is_empty()).then_some((count.parse().ok()?, inner))
+}
+
+pub(crate) fn fixed_curve_class_size(red_type: &str) -> Option<usize> {
+    match red_type {
+        "Vector2" => Some(8),
+        "Vector3" => Some(12),
+        "Vector4" | "HDRColor" => Some(16),
+        _ => None,
+    }
+}
+
+fn interpolation_type(value: u8) -> Option<&'static str> {
+    [
+        "Constant",
+        "Linear",
+        "BezierQuadratic",
+        "BezierCubic",
+        "Hermite",
+    ]
+    .get(usize::from(value))
+    .copied()
+}
+
+fn segment_link_type(value: u8) -> Option<&'static str> {
+    ["ESLT_Normal", "ESLT_Smooth", "ESLT_SmoothSymmetric"]
+        .get(usize::from(value))
+        .copied()
+}
+
+fn channel_link_type(value: u8) -> Option<&'static str> {
+    ["Normal", "Smooth", "SmoothSymmertric"]
+        .get(usize::from(value))
+        .copied()
 }
 
 fn storage_string(red_type: &str, value: &str) -> Value {
@@ -913,8 +1505,11 @@ fn storage_u64(red_type: &str, value: u64) -> Value {
 
 fn import_flags(flags: u16) -> String {
     match flags {
-        1 => "Template",
-        2 => "Soft",
+        1 => "Obligatory",
+        2 => "Template",
+        4 => "Soft",
+        8 => "Embedded",
+        16 => "Inplace",
         _ => "Default",
     }
     .to_owned()
@@ -942,13 +1537,61 @@ fn unsupported(red_type: &str) -> CodecError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        channel_link_type, expand_handles, interpolation_type, segment_link_type,
+        split_fixed_array_type,
+    };
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+
+    #[test]
+    fn handle_ids_follow_export_order() {
+        let exports = vec![
+            json!({"$type": "Root"}),
+            json!({"$type": "Second"}),
+            json!({"$type": "First"}),
+        ];
+        let value = json!([
+            {"$handle": 2},
+            {"$handle": 2},
+            {"$handle": 1}
+        ]);
+
+        let handle_ids = HashMap::from([(1, 0), (2, 1)]);
+        let actual = expand_handles(&value, &exports, &handle_ids, &mut HashSet::new()).unwrap();
+
+        assert_eq!(
+            actual,
+            json!([
+                {"HandleId": "1", "Data": {"$type": "First"}},
+                {"HandleRefId": "1"},
+                {"HandleId": "0", "Data": {"$type": "Second"}}
+            ])
+        );
+    }
 
     #[test]
     fn expand_handles_decodes_zero_pointer_as_null() {
         let value = json!({"$handle": u32::MAX});
-        let expanded = expand_handles(value, &[], &mut HashSet::new()).unwrap();
+        let actual = expand_handles(&value, &[], &HashMap::new(), &mut HashSet::new()).unwrap();
 
-        assert_eq!(expanded, Value::Null);
+        assert_eq!(actual, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn parses_fixed_array_type() {
+        assert_eq!(split_fixed_array_type("[3]Int16"), Some((3, "Int16")));
+        assert_eq!(split_fixed_array_type("[2][3]Float"), Some((2, "[3]Float")));
+        assert_eq!(split_fixed_array_type("array:Int16"), None);
+    }
+
+    #[test]
+    fn maps_legacy_curve_enums() {
+        assert_eq!(interpolation_type(3), Some("BezierCubic"));
+        assert_eq!(segment_link_type(1), Some("ESLT_Smooth"));
+        assert_eq!(channel_link_type(2), Some("SmoothSymmertric"));
+        assert_eq!(interpolation_type(5), None);
+        assert_eq!(segment_link_type(3), None);
+        assert_eq!(channel_link_type(3), None);
     }
 }

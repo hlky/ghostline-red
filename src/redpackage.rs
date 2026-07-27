@@ -774,6 +774,17 @@ impl Reader<'_> {
                     split_count_type(&red_type[7..]).ok_or_else(|| unsupported(red_type))?;
                 self.read_array(inner, count, start, limit)
             }
+            _ if red_type.starts_with('[') => {
+                let (capacity, inner) =
+                    split_fixed_array_type(red_type).ok_or_else(|| unsupported(red_type))?;
+                let count = usize::try_from(u32_at(self.bytes, start)?)
+                    .map_err(|_| malformed(start, "fixed array count"))?;
+                if count > capacity {
+                    return Err(malformed(start, "fixed array capacity"));
+                }
+                let (elements, end) = self.read_array(inner, count, start + 4, limit)?;
+                Ok((json!({"Elements": elements}), end))
+            }
             _ if red_type.starts_with("handle:") || red_type.starts_with("whandle:") => {
                 let (pointer, end) = if self.version == 2 {
                     (i32::from(i16_at(self.bytes, start)?), start + 2)
@@ -799,12 +810,12 @@ impl Reader<'_> {
                         PackagePath::Text(path) => (
                             path.clone(),
                             "string",
-                            if import.soft { "Soft" } else { "Default" },
+                            if import.soft { "Obligatory" } else { "Default" },
                         ),
                         PackagePath::Hash(hash) => (
                             hash.to_string(),
                             "uint64",
-                            if import.soft { "Soft" } else { "Default" },
+                            if import.soft { "Obligatory" } else { "Default" },
                         ),
                     }
                 };
@@ -855,7 +866,16 @@ impl Reader<'_> {
     ) -> Result<(Value, usize), PackageError> {
         let mut values = Vec::with_capacity(count);
         for _ in 0..count {
-            let element_limit = fixed_size(inner).map_or(limit, |size| cursor + size);
+            let element_limit = fixed_size(inner).map_or_else(
+                || {
+                    if self.classes.contains(inner) || is_variable_size(inner) {
+                        limit
+                    } else {
+                        cursor.saturating_add(2)
+                    }
+                },
+                |size| cursor + size,
+            );
             let (value, end) = self.read_value(inner, cursor, element_limit)?;
             if end <= cursor || end > limit {
                 return Err(malformed(cursor, "array element bounds"));
@@ -1100,6 +1120,25 @@ impl<'a> Encoder<'a> {
                 }
                 self.encode_array_elements(values, inner, count, start, limit)
             }
+            _ if red_type.starts_with('[') => {
+                let (capacity, inner) =
+                    split_fixed_array_type(red_type).ok_or_else(|| unsupported(red_type))?;
+                let elements = value
+                    .get("Elements")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| malformed(start, "fixed array Elements"))?;
+                if elements.len() > capacity {
+                    return Err(malformed(start, "fixed array capacity"));
+                }
+                self.encode_array(
+                    value
+                        .get("Elements")
+                        .expect("fixed array Elements was validated"),
+                    inner,
+                    start,
+                    limit,
+                )
+            }
             _ if red_type.starts_with("handle:") || red_type.starts_with("whandle:") => {
                 let template_pointer = if self.reader.version == 2 {
                     i32::from(i16_at(self.template, start)?)
@@ -1122,7 +1161,10 @@ impl<'a> Encoder<'a> {
                     .pointer("/DepotPath/$value")
                     .and_then(Value::as_str)
                     .ok_or_else(|| malformed(start, "resource path"))?;
-                let soft = value.get("Flags").and_then(Value::as_str) == Some("Soft");
+                let soft = matches!(
+                    value.get("Flags").and_then(Value::as_str),
+                    Some("Obligatory" | "Soft")
+                );
                 let explicit_hash = value
                     .pointer("/DepotPath/$storage")
                     .and_then(Value::as_str)
@@ -1279,7 +1321,16 @@ impl<'a> Encoder<'a> {
         let mut templates = Vec::with_capacity(template_count);
         let mut cursor = start;
         for _ in 0..template_count {
-            let element_limit = fixed_size(inner).map_or(limit, |size| cursor + size);
+            let element_limit = fixed_size(inner).map_or_else(
+                || {
+                    if self.reader.classes.contains(inner) || is_variable_size(inner) {
+                        limit
+                    } else {
+                        cursor.saturating_add(2)
+                    }
+                },
+                |size| cursor + size,
+            );
             let (_, end) = self.reader.read_value(inner, cursor, element_limit)?;
             templates.push((cursor, element_limit, end));
             cursor = end;
@@ -1765,9 +1816,24 @@ fn fixed_size(red_type: &str) -> Option<usize> {
     }
 }
 
+fn is_variable_size(red_type: &str) -> bool {
+    matches!(
+        red_type,
+        "String" | "CString" | "NodeRef" | "LocalizationString" | "DataBuffer" | "SharedDataBuffer"
+    ) || red_type.starts_with("array:")
+        || red_type.starts_with("static:")
+        || red_type.starts_with('[')
+}
+
 fn split_count_type(value: &str) -> Option<(usize, &str)> {
     let (count, inner) = value.split_once(',')?;
     Some((count.parse().ok()?, inner))
+}
+
+fn split_fixed_array_type(value: &str) -> Option<(usize, &str)> {
+    let value = value.strip_prefix('[')?;
+    let (count, inner) = value.split_once(']')?;
+    (!inner.is_empty()).then_some((count.parse().ok()?, inner))
 }
 
 fn length_prefixed_string(bytes: &[u8], start: usize) -> Result<(String, usize), PackageError> {
@@ -1848,4 +1914,18 @@ fn malformed(offset: usize, reason: &'static str) -> PackageError {
 
 fn unsupported(red_type: &str) -> PackageError {
     PackageError::Unsupported(red_type.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_fixed_array_type;
+
+    #[test]
+    fn parses_fixed_array_type() {
+        assert_eq!(
+            split_fixed_array_type("[3]inkTextureSlot"),
+            Some((3, "inkTextureSlot"))
+        );
+        assert_eq!(split_fixed_array_type("array:inkTextureSlot"), None);
+    }
 }

@@ -60,6 +60,8 @@ pub enum ArchiveError {
     DecompressionWorker,
     #[error("clean Kraken decoder failed ({clean}); native worker also failed")]
     KrakenFallbackFailed { clean: kraken::KrakenError },
+    #[error("native Rust Kraken decoder failed: {0}")]
+    KrakenDecode(#[from] kraken::KrakenError),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -595,8 +597,8 @@ fn should_store_uncompressed(depot_path: &str) -> bool {
 
 /// Compresses a framed batch inside the current process.
 ///
-/// This exists for the hidden crash-isolated worker command. Normal packing
-/// must use the worker rather than calling this function directly.
+/// This exists only for the hidden crash-isolated native-library diagnostic
+/// worker. Normal packing uses the Rust encoder directly.
 ///
 /// # Errors
 ///
@@ -673,13 +675,28 @@ pub fn decompress_worker(wire_input: &[u8], kraken_path: &OsStr) -> Result<Vec<u
         .map_err(ArchiveError::from)
 }
 
-/// Decompresses a raw Kraken stream in a crash-isolated worker.
+/// Decompresses a raw Kraken stream with the native Rust implementation.
 ///
 /// # Errors
 ///
-/// Returns [`ArchiveError`] if the worker cannot start, crashes, rejects the
-/// stream, or produces a size other than `expected_size`.
+/// Returns [`ArchiveError`] if the stream is unsupported, malformed, or does
+/// not produce exactly `expected_size` bytes.
 pub fn decompress_payload_isolated(
+    input: &[u8],
+    expected_size: usize,
+    _kraken_path: &OsStr,
+) -> Result<Vec<u8>, ArchiveError> {
+    Ok(kraken::decode(input, expected_size)?)
+}
+
+/// Tries the native Rust decoder before an explicitly requested native-library
+/// fallback in a crash-isolated worker.
+///
+/// # Errors
+///
+/// Returns [`ArchiveError`] if neither implementation decodes exactly
+/// `expected_size` bytes.
+pub fn decompress_payload_native_fallback(
     input: &[u8],
     expected_size: usize,
     kraken_path: &OsStr,
@@ -719,7 +736,17 @@ pub fn decompress_payload_isolated(
     Ok(output.stdout)
 }
 
-fn compress_batch_isolated(inputs: &[Vec<u8>], kraken_path: &OsStr) -> Vec<Option<Vec<u8>>> {
+fn compress_batch_isolated(inputs: &[Vec<u8>], _kraken_path: &OsStr) -> Vec<Option<Vec<u8>>> {
+    inputs
+        .iter()
+        .map(|input| {
+            let encoded = kraken::encode(input);
+            (encoded.len() < input.len()).then_some(encoded)
+        })
+        .collect()
+}
+
+fn compress_batch_native_worker(inputs: &[Vec<u8>], kraken_path: &OsStr) -> Vec<Option<Vec<u8>>> {
     if inputs.is_empty() {
         return Vec::new();
     }
@@ -772,15 +799,23 @@ fn compress_batch_isolated(inputs: &[Vec<u8>], kraken_path: &OsStr) -> Vec<Optio
     parse_compression_batch(&output.stdout, inputs.len()).unwrap_or_else(fallback)
 }
 
-/// Compresses one payload through the crash-isolated native worker, falling
-/// back to the clean-room encoder if the worker is unavailable or does not
-/// produce a smaller representation.
+/// Compresses one payload with the native Rust Kraken encoder.
 ///
-/// This function is infallible by design; worker failures select the safe
-/// clean-room representation.
+/// This function is infallible by design.
 #[must_use]
 pub fn compress_payload_isolated(input: &[u8], kraken_path: &OsStr) -> Vec<u8> {
     compress_batch_isolated(&[input.to_vec()], kraken_path)
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or_else(|| kraken::encode(input))
+}
+
+/// Compresses one payload through an explicitly requested crash-isolated
+/// native-library worker, falling back to the native Rust encoder.
+#[must_use]
+pub fn compress_payload_native_worker(input: &[u8], kraken_path: &OsStr) -> Vec<u8> {
+    compress_batch_native_worker(&[input.to_vec()], kraken_path)
         .into_iter()
         .next()
         .flatten()

@@ -79,9 +79,10 @@ $red = '.\target\release\ghostline-red.exe'
 $kraken = 'C:\Tools\WolvenKit\kraken.dll'
 ```
 
-The `--kraken` argument identifies the library for explicit native diagnostics
-and fallback paths. Payloads that do not benefit from clean compression are
-stored as ordinary uncompressed archive segments.
+The `--kraken` argument identifies the library only for explicit native
+diagnostic flags. Normal archive, CR2W, and LXRS paths always use the Rust
+implementation. Payloads that do not benefit from Rust compression are stored
+as ordinary uncompressed archive segments.
 
 ## Clean-room Kraken commands
 

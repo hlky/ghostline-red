@@ -2888,12 +2888,24 @@ impl<'a> PairedBits<'a> {
     }
 
     fn read_front_distance(&mut self, packed: u8) -> Result<usize, KrakenError> {
+        if packed >= 0xf0 {
+            let bit_count = u32::from(packed - 0xf0) + 4;
+            let high = self.read_front(bit_count)?;
+            let low = self.read_front(12)?;
+            return decode_far_distance_value(bit_count, high, low, self.stream_offset);
+        }
         let tier = u32::from(packed >> 4);
         let extra = self.read_front(tier + 4)?;
         decode_distance_value(packed, tier, extra, self.stream_offset)
     }
 
     fn read_back_distance(&mut self, packed: u8) -> Result<usize, KrakenError> {
+        if packed >= 0xf0 {
+            let bit_count = u32::from(packed - 0xf0) + 4;
+            let high = self.read_back(bit_count)?;
+            let low = self.read_back(12)?;
+            return decode_far_distance_value(bit_count, high, low, self.stream_offset);
+        }
         let tier = u32::from(packed >> 4);
         let extra = self.read_back(tier + 4)?;
         decode_distance_value(packed, tier, extra, self.stream_offset)
@@ -2969,6 +2981,20 @@ fn decode_distance_value(
 ) -> Result<usize, KrakenError> {
     let base = 8_u64 + (((1_u64 << tier) - 1) << 8);
     let distance = base + u64::from(packed & 0xf) + (u64::from(extra) << 4);
+    usize::try_from(distance).map_err(|_| KrakenError::InvalidQuantum { offset })
+}
+
+fn decode_far_distance_value(
+    bit_count: u32,
+    high: u32,
+    low: u32,
+    offset: usize,
+) -> Result<usize, KrakenError> {
+    if !(4..=19).contains(&bit_count) || high >= 1_u32 << bit_count || low >= 1_u32 << 12 {
+        return Err(KrakenError::InvalidQuantum { offset });
+    }
+    let prefix = (1_u64 << bit_count) | u64::from(high);
+    let distance = 8_322_816_u64 + (prefix << 12) + u64::from(low);
     usize::try_from(distance).map_err(|_| KrakenError::InvalidQuantum { offset })
 }
 
@@ -3091,10 +3117,10 @@ mod tests {
     use super::{
         BLOCK_SIZE, CHUNK_SIZE, COMPRESSED_BLOCK_HEADER, Cursor, KrakenError, LsbWriter,
         MAINMENU_RLE_COMMAND_HEADER, PairedBits, STREAMINGWORLD_LITERAL_HEADER,
-        canonical_huffman_table, decode, decode_array, decode_lz_payload, decode_quantum,
-        decode_rle, decode_scaled_offset_value, encode, encode_array_envelope,
-        encode_contiguous_new_huffman_header, encode_extended_length, encode_greedy_lz_chunk,
-        execute_lz_commands,
+        canonical_huffman_table, decode, decode_array, decode_far_distance_value,
+        decode_lz_payload, decode_quantum, decode_rle, decode_scaled_offset_value, encode,
+        encode_array_envelope, encode_contiguous_new_huffman_header, encode_extended_length,
+        encode_greedy_lz_chunk, execute_lz_commands,
     };
 
     #[test]
@@ -3858,6 +3884,17 @@ mod tests {
             assert_eq!(bits.read_back_gamma_minus_one(), Ok(count));
             assert_eq!(bits.read_front_distance(packed), Ok(expected));
         }
+    }
+
+    #[test]
+    fn decodes_far_distance_escape_tiers() {
+        assert_eq!(decode_far_distance_value(4, 0, 0, 0), Ok(8_388_352));
+        assert_eq!(decode_far_distance_value(4, 15, 4095, 0), Ok(8_453_887));
+        assert_eq!(decode_far_distance_value(5, 0, 0, 0), Ok(8_453_888));
+        assert_eq!(
+            decode_far_distance_value(3, 0, 0, 9),
+            Err(KrakenError::InvalidQuantum { offset: 9 })
+        );
     }
 
     #[test]

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use ghostline_red::{archive, codec, cr2w, kraken, localization, schema, writer};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -11,7 +11,7 @@ use std::{
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Path to `WolvenKit`'s compatible Kraken compression library.
+    /// Optional Kraken library used only by explicit native diagnostic flags.
     #[arg(long, global = true, default_value = "kraken.dll")]
     kraken: PathBuf,
     #[command(subcommand)]
@@ -81,15 +81,17 @@ enum Command {
     /// Decode reflected CR2W exports with a generated RED schema.
     Cr2wDecode {
         input: PathBuf,
-        #[arg(long)]
-        schema: PathBuf,
+        /// Schema sources in increasing precedence order.
+        #[arg(long, required = true)]
+        schema: Vec<PathBuf>,
         output: PathBuf,
     },
     /// Serialize CR2W to recursive WKit-shaped JSON.
     Cr2wSerialize {
         input: PathBuf,
-        #[arg(long)]
-        schema: PathBuf,
+        /// Schema sources in increasing precedence order.
+        #[arg(long, required = true)]
+        schema: Vec<PathBuf>,
         output: PathBuf,
     },
     /// Deserialize WKit-shaped JSON using an existing CR2W table/layout template.
@@ -97,8 +99,9 @@ enum Command {
         input: PathBuf,
         #[arg(long)]
         template: PathBuf,
-        #[arg(long)]
-        schema: PathBuf,
+        /// Schema sources in increasing precedence order.
+        #[arg(long, required = true)]
+        schema: Vec<PathBuf>,
         output: PathBuf,
     },
     /// Serialize supported onscreen localization CR2W to WolvenKit-shaped JSON.
@@ -141,7 +144,7 @@ fn main() -> Result<()> {
             let decoded =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
             let encoded = if native {
-                archive::compress_payload_isolated(&decoded, cli.kraken.as_os_str())
+                archive::compress_payload_native_worker(&decoded, cli.kraken.as_os_str())
             } else {
                 kraken::encode(&decoded)
             };
@@ -157,7 +160,7 @@ fn main() -> Result<()> {
             let encoded =
                 fs::read(&input).with_context(|| format!("failed to read {}", input.display()))?;
             let decoded = if native_fallback {
-                archive::decompress_payload_isolated(&encoded, size, cli.kraken.as_os_str())
+                archive::decompress_payload_native_fallback(&encoded, size, cli.kraken.as_os_str())
                     .with_context(|| format!("failed to decode {}", input.display()))?
             } else {
                 kraken::decode(&encoded, size)
@@ -271,10 +274,9 @@ fn main() -> Result<()> {
             schema,
             output,
         } => {
-            let classes: BTreeMap<String, schema::RedClass> =
-                serde_json::from_slice(&fs::read(schema)?)?;
-            let class_names: BTreeSet<String> = classes.keys().cloned().collect();
-            let document = codec::decode_exports(&input, &class_names, cli.kraken.as_os_str())?;
+            let schema = load_schemas(&schema)?;
+            let document =
+                codec::decode_exports_with_red_schema(&input, &schema, cli.kraken.as_os_str())?;
             fs::write(output, serde_json::to_vec_pretty(&document)?)?;
         }
         Command::Cr2wSerialize {
@@ -282,10 +284,9 @@ fn main() -> Result<()> {
             schema,
             output,
         } => {
-            let classes: HashMap<String, schema::RedClass> =
-                serde_json::from_slice(&fs::read(schema)?)?;
-            let class_names: BTreeSet<String> = classes.into_keys().collect();
-            let document = codec::decode_wkit(&input, &class_names, cli.kraken.as_os_str())?;
+            let schema = load_schemas(&schema)?;
+            let document =
+                codec::decode_wkit_with_red_schema(&input, &schema, cli.kraken.as_os_str())?;
             fs::write(output, serde_json::to_vec_pretty(&document)?)?;
         }
         Command::Cr2wDeserialize {
@@ -294,15 +295,12 @@ fn main() -> Result<()> {
             schema,
             output,
         } => {
-            let classes: BTreeMap<String, schema::RedClass> =
-                serde_json::from_slice(&fs::read(schema)?)?;
-            let class_names: BTreeSet<String> = classes.keys().cloned().collect();
-            writer::write_with_template(
+            let schema = load_schemas(&schema)?;
+            writer::write_with_red_schema(
                 &input,
                 &template,
                 &output,
-                &class_names,
-                &classes,
+                &schema,
                 cli.kraken.as_os_str(),
             )?;
         }
@@ -342,6 +340,20 @@ fn load_depot_paths(root: &Path) -> Result<HashMap<u64, String>> {
             let depot_path = relative.to_string_lossy().replace('/', "\\");
             result.insert(archive::depot_path_hash(&depot_path), depot_path);
         }
+    }
+    Ok(result)
+}
+
+fn load_schemas(paths: &[PathBuf]) -> Result<schema::RedSchema> {
+    let mut result = schema::RedSchema::default();
+    for path in paths {
+        result.merge(
+            schema::RedSchema::from_slice(
+                &fs::read(path)
+                    .with_context(|| format!("failed to read schema {}", path.display()))?,
+            )
+            .with_context(|| format!("failed to parse schema {}", path.display()))?,
+        );
     }
     Ok(result)
 }

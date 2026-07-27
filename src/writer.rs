@@ -2,12 +2,14 @@
 
 use crate::{
     archive::{self, ArchiveError},
+    codec::{self, fixed_curve_class_size},
     cr2w::{self, Cr2wError, Cr2wInspection},
     redpackage::{self, PackageError, PackageSettings},
-    schema,
+    schema::{self, RedSchema},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crc32fast::Hasher;
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
     borrow::Cow,
@@ -104,6 +106,8 @@ struct Encoder<'a> {
     discovering_handles: Cell<bool>,
     classes: &'a BTreeSet<String>,
     schema: &'a BTreeMap<String, schema::RedClass>,
+    enums: Option<&'a BTreeSet<String>>,
+    bitfields: Option<&'a BTreeSet<String>>,
 }
 
 /// Writes WKit-shaped JSON using an existing CR2W resource as its audited
@@ -117,10 +121,6 @@ struct Encoder<'a> {
 ///
 /// Returns [`WriterError`] for malformed JSON/templates, values not present in
 /// the template name/import tables, unsupported structural changes, or I/O.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the sequential container rebuild keeps offset and CRC patching auditable"
-)]
 pub fn write_with_template(
     json_path: &Path,
     template_path: &Path,
@@ -129,7 +129,63 @@ pub fn write_with_template(
     schema: &BTreeMap<String, schema::RedClass>,
     kraken_path: &OsStr,
 ) -> Result<(), WriterError> {
-    let document: Value = serde_json::from_slice(&fs::read(json_path)?)?;
+    write_with_schema(
+        json_path,
+        template_path,
+        output_path,
+        classes,
+        schema,
+        None,
+        None,
+        None,
+        kraken_path,
+    )
+}
+
+/// Writes WKit-shaped JSON with explicit official enum and bitfield categories.
+///
+/// # Errors
+///
+/// Returns [`WriterError`] under the same conditions as
+/// [`write_with_template`].
+pub fn write_with_red_schema(
+    json_path: &Path,
+    template_path: &Path,
+    output_path: &Path,
+    schema: &RedSchema,
+    kraken_path: &OsStr,
+) -> Result<(), WriterError> {
+    let classes = schema.class_names();
+    write_with_schema(
+        json_path,
+        template_path,
+        output_path,
+        &classes,
+        &schema.classes,
+        Some(&schema.enums),
+        Some(&schema.bitfields),
+        Some(schema),
+        kraken_path,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the sequential container rebuild keeps offset and CRC patching auditable"
+)]
+fn write_with_schema(
+    json_path: &Path,
+    template_path: &Path,
+    output_path: &Path,
+    classes: &BTreeSet<String>,
+    schema: &BTreeMap<String, schema::RedClass>,
+    enums: Option<&BTreeSet<String>>,
+    bitfields: Option<&BTreeSet<String>>,
+    red_schema: Option<&RedSchema>,
+    kraken_path: &OsStr,
+) -> Result<(), WriterError> {
+    let document = read_json(json_path)?;
     let root = document
         .pointer("/Data/RootChunk")
         .ok_or_else(|| unsupported("missing Data.RootChunk"))?;
@@ -157,13 +213,27 @@ pub fn write_with_template(
     }
     let template = fs::read(template_path)?;
     collect_buffer_overrides(&document, &mut buffer_overrides)?;
-    collect_redpackage_overrides(
-        &document,
-        &file,
-        &template,
+    remap_buffer_overrides(&mut buffer_overrides, &file, &template, kraken_path)?;
+    let redpackage_ordinals = red_schema
+        .and_then(|schema| {
+            codec::decode_wkit_with_red_schema(template_path, schema, kraken_path).ok()
+        })
+        .map_or_else(HashMap::new, |template_document| {
+            redpackage_ordinal_map(&document, &template_document)
+        });
+    let redpackage_context = RedPackageContext {
+        file: &file,
+        template: &template,
         classes,
         kraken_path,
+        ordinals: &redpackage_ordinals,
+    };
+    let mut claimed_redpackages = HashSet::new();
+    collect_redpackage_overrides(
+        &document,
+        &redpackage_context,
         &mut buffer_overrides,
+        &mut claimed_redpackages,
     )?;
     let names = file
         .names
@@ -207,6 +277,8 @@ pub fn write_with_template(
         discovering_handles: Cell::new(true),
         classes,
         schema,
+        enums,
+        bitfields,
     };
     // Seed discovery with every authored handle definition. Template-shaped
     // traversal can skip handles that only become reachable after array
@@ -360,7 +432,7 @@ pub fn write_with_template(
         let (bytes, memory_size) = if let Some(replacement) = buffer_overrides.get(&index) {
             if replacement.stored {
                 (replacement.bytes.clone(), replacement.memory_size)
-            } else if buffer_matches(stored, buffer.memory_size, &replacement.bytes, kraken_path)? {
+            } else if buffer_matches(stored, &replacement.bytes, kraken_path)? {
                 (stored.to_vec(), buffer.memory_size)
             } else {
                 (
@@ -393,6 +465,14 @@ pub fn write_with_template(
     Ok(())
 }
 
+fn read_json(path: &Path) -> Result<Value, WriterError> {
+    let bytes = fs::read(path)?;
+    let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+    deserializer.disable_recursion_limit();
+    let deserializer = serde_stacker::Deserializer::new(&mut deserializer);
+    Ok(Value::deserialize(deserializer)?)
+}
+
 impl Encoder<'_> {
     #[expect(
         clippy::too_many_lines,
@@ -412,6 +492,15 @@ impl Encoder<'_> {
             .ok_or_else(|| unsupported("class template bounds"))?;
         if red_type == "AreaShapeOutline" {
             return Ok((area_shape_outline_buffer(value)?, template_end));
+        }
+        if is_opaque_custom_data(red_type) {
+            let bytes = value
+                .get("$rawData")
+                .and_then(Value::as_str)
+                .map(|bytes| STANDARD.decode(bytes))
+                .transpose()?
+                .unwrap_or_else(|| self.template[template_start..template_end].to_vec());
+            return Ok((bytes, template_end));
         }
         let object = value
             .as_object()
@@ -447,8 +536,14 @@ impl Encoder<'_> {
             let property_value = object
                 .get(property)
                 .ok_or_else(|| unsupported(format!("{red_type}.{property} missing")))?;
-            let (payload, consumed) =
-                self.encode_value(property_value, property_type, cursor, payload_size, chunks)?;
+            let (payload, consumed) = self
+                .encode_value(property_value, property_type, cursor, payload_size, chunks)
+                .map_err(|error| match error {
+                    WriterError::Unsupported(reason) => {
+                        unsupported(format!("{red_type}.{property}: {reason}"))
+                    }
+                    other => other,
+                })?;
             if consumed != payload_end {
                 return Err(unsupported(format!(
                     "{red_type}.{property} template was not consumed"
@@ -513,6 +608,16 @@ impl Encoder<'_> {
             output.extend_from_slice(&self.template[cursor..template_end]);
             return Ok((output, template_end));
         }
+        if cursor < template_end && is_opaque_appendix(red_type) {
+            let tail = object
+                .get("$rawTail")
+                .and_then(Value::as_str)
+                .map(|bytes| STANDARD.decode(bytes))
+                .transpose()?
+                .unwrap_or_else(|| self.template[cursor..template_end].to_vec());
+            output.extend_from_slice(&tail);
+            return Ok((output, template_end));
+        }
         Ok((output, cursor))
     }
 
@@ -551,7 +656,7 @@ impl Encoder<'_> {
                 .to_le_bytes()
                 .to_vec()),
             "String" => encode_string(value.as_str().ok_or_else(|| unsupported("String value"))?),
-            "NodeRef" => encode_string(storage_value(value)?),
+            "NodeRef" => encode_string(node_ref_value(value)?),
             "TweakDBID" => Ok(tweak_db_id(storage_or_string(value)?)?
                 .to_le_bytes()
                 .to_vec()),
@@ -718,7 +823,7 @@ impl Encoder<'_> {
             u32::try_from(node_refs.len()).map_err(|_| WriterError::TooLarge)?,
         );
         for node_ref in node_refs {
-            output.extend_from_slice(&encode_string(storage_value(node_ref)?)?);
+            output.extend_from_slice(&encode_string(node_ref_value(node_ref)?)?);
         }
 
         let variants = object
@@ -808,10 +913,14 @@ impl Encoder<'_> {
                     .to_le_bytes()
                     .to_vec(),
             ),
-            "String" => exact(encode_string(
+            "String" => exact(encode_string_with_template(
                 value.as_str().ok_or_else(|| unsupported("String value"))?,
+                &self.template[template_start..template_end],
             )?),
-            "NodeRef" => exact(encode_string(storage_value(value)?)?),
+            "NodeRef" => exact(encode_string_with_template(
+                node_ref_value(value)?,
+                &self.template[template_start..template_end],
+            )?),
             "TweakDBID" => exact(
                 tweak_db_id(storage_or_string(value)?)?
                     .to_le_bytes()
@@ -844,21 +953,71 @@ impl Encoder<'_> {
                 )?);
                 exact(output)
             }
+            "SharedDataBuffer" => {
+                let Some(bytes) = value.get("Bytes").and_then(Value::as_str) else {
+                    return exact(self.template[template_start..template_end].to_vec());
+                };
+                let bytes = STANDARD.decode(bytes)?;
+                let mut output = u32::try_from(bytes.len())
+                    .map_err(|_| WriterError::TooLarge)?
+                    .to_le_bytes()
+                    .to_vec();
+                output.extend_from_slice(&bytes);
+                exact(output)
+            }
             "DataBuffer" | "serializationDeferredDataBuffer" => {
                 exact(self.template[template_start..template_end].to_vec())
             }
+            _ if is_opaque_custom_data(red_type) => {
+                let bytes = value
+                    .get("$rawData")
+                    .and_then(Value::as_str)
+                    .map(|bytes| STANDARD.decode(bytes))
+                    .transpose()?
+                    .unwrap_or_else(|| self.template[template_start..template_end].to_vec());
+                exact(bytes)
+            }
             _ if red_type.starts_with("array:") => {
                 self.encode_array(value, &red_type[6..], template_start, template_size, chunks)
+            }
+            _ if red_type.starts_with('[') => {
+                let (capacity, inner) =
+                    split_fixed_array_type(red_type).ok_or_else(|| unsupported(red_type))?;
+                let elements = value
+                    .get("Elements")
+                    .ok_or_else(|| unsupported("fixed array Elements"))?;
+                if elements
+                    .as_array()
+                    .is_none_or(|elements| elements.len() > capacity)
+                {
+                    return Err(unsupported("fixed array capacity"));
+                }
+                self.encode_array(elements, inner, template_start, template_size, chunks)
+            }
+            _ if red_type.starts_with("curveData:") => self.encode_legacy_curve(
+                value,
+                &red_type[10..],
+                template_start,
+                template_size,
+                chunks,
+            ),
+            _ if red_type.starts_with("multiChannelCurve:") => {
+                self.encode_multi_channel_curve(value, template_start, template_size)
             }
             _ if red_type.starts_with("handle:") || red_type.starts_with("whandle:") => {
                 if value.is_null() {
                     return exact(0_u32.to_le_bytes().to_vec());
                 }
                 let template_stored = self.u32(template_start)?;
+                if template_stored == 0 {
+                    // WolvenKit materializes some default handle objects that
+                    // are represented by a null pointer on disk.
+                    return exact(0_u32.to_le_bytes().to_vec());
+                }
                 let template_export_index = usize::try_from(
                     template_stored
                         .checked_sub(1)
-                        .ok_or_else(|| unsupported("non-null handle has null template"))?,
+                        .ok_or_else(|| unsupported("handle template index"))?,
                 )
                 .map_err(|_| WriterError::TooLarge)?;
                 let identity = handle_identity(value, template_export_index)?;
@@ -947,7 +1106,11 @@ impl Encoder<'_> {
                         return exact(index.to_le_bytes().to_vec());
                     }
                     let flags = match value.get("Flags").and_then(Value::as_str) {
+                        Some("Obligatory") => 1,
+                        Some("Template") => 2,
                         Some("Soft") => 4,
+                        Some("Embedded") => 8,
+                        Some("Inplace") => 16,
                         Some("Default") | None => 0,
                         Some(other) => {
                             return Err(unsupported(format!("resource reference flags {other}")));
@@ -965,18 +1128,23 @@ impl Encoder<'_> {
                 };
                 exact(index.to_le_bytes().to_vec())
             }
+            _ if self
+                .bitfields
+                .is_some_and(|bitfields| bitfields.contains(red_type)) =>
+            {
+                exact(self.encode_bitfield(value)?)
+            }
+            _ if self.enums.is_some_and(|enums| enums.contains(red_type)) => exact(
+                self.name_index(
+                    value
+                        .as_str()
+                        .ok_or_else(|| unsupported(format!("{red_type} enum")))?,
+                )?
+                .to_le_bytes()
+                .to_vec(),
+            ),
             _ if value.is_string() && template_size >= 4 && template_size.is_multiple_of(2) => {
-                let mut output = Vec::new();
-                for item in value
-                    .as_str()
-                    .ok_or_else(|| unsupported("bitfield value"))?
-                    .split(", ")
-                    .filter(|item| !item.is_empty())
-                {
-                    output.extend_from_slice(&self.name_index(item)?.to_le_bytes());
-                }
-                output.extend_from_slice(&0_u16.to_le_bytes());
-                exact(output)
+                exact(self.encode_bitfield(value)?)
             }
             _ if self.classes.contains(red_type) && template_size != 2 => {
                 self.encode_class(value, template_start, template_size, red_type, chunks)
@@ -992,6 +1160,20 @@ impl Encoder<'_> {
             ),
             _ => exact(self.template[template_start..template_end].to_vec()),
         }
+    }
+
+    fn encode_bitfield(&self, value: &Value) -> Result<Vec<u8>, WriterError> {
+        let mut output = Vec::new();
+        for item in value
+            .as_str()
+            .ok_or_else(|| unsupported("bitfield value"))?
+            .split(", ")
+            .filter(|item| !item.is_empty() && *item != "0")
+        {
+            output.extend_from_slice(&self.name_index(item)?.to_le_bytes());
+        }
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        Ok(output)
     }
 
     fn encode_array<'v>(
@@ -1052,6 +1234,175 @@ impl Encoder<'_> {
         Ok((output, template_end))
     }
 
+    fn encode_legacy_curve<'v>(
+        &self,
+        value: &'v Value,
+        inner: &str,
+        template_start: usize,
+        template_size: usize,
+        chunks: &mut HashMap<usize, &'v Value>,
+    ) -> Result<(Vec<u8>, usize), WriterError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| unsupported("curve value"))?;
+        let values = object
+            .get("Elements")
+            .and_then(Value::as_array)
+            .ok_or_else(|| unsupported("curve Elements"))?;
+        let template_end = template_start
+            .checked_add(template_size)
+            .filter(|end| *end <= self.template.len())
+            .ok_or_else(|| unsupported("curve template bounds"))?;
+        let values_end = template_end
+            .checked_sub(2)
+            .filter(|end| *end >= template_start + 4)
+            .ok_or_else(|| unsupported("curve template bounds"))?;
+        let template_count =
+            usize::try_from(self.u32(template_start)?).map_err(|_| WriterError::TooLarge)?;
+        let mut cursor = template_start + 4;
+        let mut element_templates = Vec::with_capacity(template_count);
+        for _ in 0..template_count {
+            cursor = cursor
+                .checked_add(4)
+                .filter(|cursor| *cursor <= values_end)
+                .ok_or_else(|| unsupported("curve point bounds"))?;
+            let element_start = cursor;
+            cursor = if let Some(size) = fixed_curve_class_size(inner) {
+                cursor
+                    .checked_add(size)
+                    .filter(|cursor| *cursor <= values_end)
+                    .ok_or_else(|| unsupported("fixed curve class bounds"))?
+            } else {
+                self.skip_value(inner, cursor, values_end)?
+            };
+            element_templates.push((element_start, cursor - element_start));
+        }
+        if cursor != values_end {
+            return Err(unsupported("curve template trailing bytes"));
+        }
+        if values.len() != element_templates.len() {
+            return Err(unsupported("curve element count change"));
+        }
+
+        let mut output = u32::try_from(values.len())
+            .map_err(|_| WriterError::TooLarge)?
+            .to_le_bytes()
+            .to_vec();
+        for (element, (element_start, element_size)) in
+            values.iter().zip(element_templates.iter().copied())
+        {
+            output.extend_from_slice(
+                &json_f32(
+                    element
+                        .get("Point")
+                        .ok_or_else(|| unsupported("curve Point"))?,
+                )?
+                .to_le_bytes(),
+            );
+            let curve_value = element
+                .get("Value")
+                .ok_or_else(|| unsupported("curve Value"))?;
+            let (encoded, consumed) =
+                if let Some(encoded) = encode_fixed_curve_class(curve_value, inner)? {
+                    (encoded, element_start + element_size)
+                } else {
+                    self.encode_value(curve_value, inner, element_start, element_size, chunks)?
+                };
+            if consumed != element_start + element_size {
+                return Err(unsupported("curve element template was not consumed"));
+            }
+            output.extend_from_slice(&encoded);
+        }
+        output.push(
+            interpolation_type_value(
+                object
+                    .get("InterpolationType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unsupported("curve InterpolationType"))?,
+            )
+            .ok_or_else(|| unsupported("curve InterpolationType"))?,
+        );
+        output.push(
+            segment_link_type_value(
+                object
+                    .get("LinkType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unsupported("curve LinkType"))?,
+            )
+            .ok_or_else(|| unsupported("curve LinkType"))?,
+        );
+        Ok((output, template_end))
+    }
+
+    fn encode_multi_channel_curve(
+        &self,
+        value: &Value,
+        template_start: usize,
+        template_size: usize,
+    ) -> Result<(Vec<u8>, usize), WriterError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| unsupported("multi-channel curve value"))?;
+        let data = STANDARD.decode(
+            object
+                .get("Data")
+                .and_then(Value::as_str)
+                .ok_or_else(|| unsupported("multi-channel curve Data"))?,
+        )?;
+        let mut output = u32::try_from(
+            object
+                .get("NumChannels")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| unsupported("multi-channel curve NumChannels"))?,
+        )
+        .map_err(|_| WriterError::TooLarge)?
+        .to_le_bytes()
+        .to_vec();
+        output.push(
+            interpolation_type_value(
+                object
+                    .get("InterpolationType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unsupported("multi-channel curve InterpolationType"))?,
+            )
+            .ok_or_else(|| unsupported("multi-channel curve InterpolationType"))?,
+        );
+        output.push(
+            channel_link_type_value(
+                object
+                    .get("LinkType")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| unsupported("multi-channel curve LinkType"))?,
+            )
+            .ok_or_else(|| unsupported("multi-channel curve LinkType"))?,
+        );
+        output.extend_from_slice(
+            &u32::try_from(
+                object
+                    .get("Alignment")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| unsupported("multi-channel curve Alignment"))?,
+            )
+            .map_err(|_| WriterError::TooLarge)?
+            .to_le_bytes(),
+        );
+        output.extend_from_slice(
+            &u32::try_from(data.len())
+                .map_err(|_| WriterError::TooLarge)?
+                .to_le_bytes(),
+        );
+        output.extend_from_slice(&data);
+        let template_end = template_start
+            .checked_add(template_size)
+            .filter(|end| *end <= self.template.len())
+            .ok_or_else(|| unsupported("multi-channel curve template bounds"))?;
+        Ok((output, template_end))
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the type dispatch mirrors encode_value and keeps bounds logic together"
+    )]
     fn skip_value(&self, red_type: &str, start: usize, limit: usize) -> Result<usize, WriterError> {
         if let Some(size) = fixed_size(red_type) {
             return start
@@ -1065,6 +1416,9 @@ impl Encoder<'_> {
         if red_type == "LocalizationString" {
             return self.skip_string(start + 8, limit);
         }
+        if matches!(red_type, "SharedDataBuffer" | "DataBuffer") {
+            return self.skip_buffer_value(red_type, start, limit);
+        }
         if let Some(inner) = red_type.strip_prefix("array:") {
             let count = usize::try_from(self.u32(start)?).map_err(|_| WriterError::TooLarge)?;
             let mut cursor = start + 4;
@@ -1072,6 +1426,69 @@ impl Encoder<'_> {
                 cursor = self.skip_value(inner, cursor, limit)?;
             }
             return Ok(cursor);
+        }
+        if let Some((capacity, inner)) = split_fixed_array_type(red_type) {
+            let count = usize::try_from(self.u32(start)?).map_err(|_| WriterError::TooLarge)?;
+            if count > capacity {
+                return Err(unsupported("fixed array capacity"));
+            }
+            let mut cursor = start + 4;
+            for _ in 0..count {
+                cursor = self.skip_value(inner, cursor, limit)?;
+            }
+            return Ok(cursor);
+        }
+        if let Some(inner) = red_type.strip_prefix("curveData:") {
+            let count = usize::try_from(self.u32(start)?).map_err(|_| WriterError::TooLarge)?;
+            let mut cursor = start + 4;
+            for _ in 0..count {
+                cursor = cursor
+                    .checked_add(4)
+                    .filter(|cursor| *cursor <= limit)
+                    .ok_or_else(|| unsupported("curve point bounds"))?;
+                cursor = if let Some(size) = fixed_curve_class_size(inner) {
+                    cursor
+                        .checked_add(size)
+                        .filter(|cursor| *cursor <= limit)
+                        .ok_or_else(|| unsupported("fixed curve class bounds"))?
+                } else {
+                    self.skip_value(inner, cursor, limit)?
+                };
+            }
+            return cursor
+                .checked_add(2)
+                .filter(|end| *end <= limit)
+                .ok_or_else(|| unsupported("curve trailing fields"));
+        }
+        if red_type.starts_with("multiChannelCurve:") {
+            let size = usize::try_from(self.u32(start + 10)?).map_err(|_| WriterError::TooLarge)?;
+            return start
+                .checked_add(14)
+                .and_then(|start| start.checked_add(size))
+                .filter(|end| *end <= limit)
+                .ok_or_else(|| unsupported("multi-channel curve bounds"));
+        }
+        if self
+            .bitfields
+            .is_some_and(|bitfields| bitfields.contains(red_type))
+        {
+            let mut cursor = start;
+            loop {
+                if cursor.checked_add(2).is_none_or(|end| end > limit) {
+                    return Err(unsupported("bitfield bounds"));
+                }
+                let index = self.u16(cursor)?;
+                cursor += 2;
+                if index == 0 {
+                    return Ok(cursor);
+                }
+            }
+        }
+        if self.enums.is_some_and(|enums| enums.contains(red_type)) {
+            return start
+                .checked_add(2)
+                .filter(|end| *end <= limit)
+                .ok_or_else(|| unsupported("enum bounds"));
         }
         if self.classes.contains(red_type) {
             let mut cursor = start;
@@ -1098,6 +1515,26 @@ impl Encoder<'_> {
             .checked_add(2)
             .filter(|end| *end <= limit)
             .ok_or_else(|| unsupported(format!("{red_type} array element")))
+    }
+
+    fn skip_buffer_value(
+        &self,
+        red_type: &str,
+        start: usize,
+        limit: usize,
+    ) -> Result<usize, WriterError> {
+        let encoded = self.u32(start)?;
+        let size = if red_type == "DataBuffer" && encoded >= 0x8000_0000 {
+            4
+        } else {
+            4_usize
+                .checked_add(usize::try_from(encoded).map_err(|_| WriterError::TooLarge)?)
+                .ok_or(WriterError::TooLarge)?
+        };
+        start
+            .checked_add(size)
+            .filter(|end| *end <= limit)
+            .ok_or_else(|| unsupported(format!("{red_type} bounds")))
     }
 
     fn skip_string(&self, start: usize, limit: usize) -> Result<usize, WriterError> {
@@ -1799,6 +2236,13 @@ fn collect_buffer_overrides(
             }
         }
         Value::Object(object) => {
+            if object
+                .get("Type")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.contains("RedPackage"))
+            {
+                return Ok(());
+            }
             if let Some(index) = object
                 .get("BufferId")
                 .and_then(Value::as_str)
@@ -1822,11 +2266,15 @@ fn collect_buffer_overrides(
                         memory_size: 0,
                     })
                 } else if let Some(bytes) = object.get("Bytes").and_then(Value::as_str) {
-                    Some(BufferOverride {
-                        bytes: STANDARD.decode(bytes)?,
-                        stored: false,
-                        memory_size: 0,
-                    })
+                    if bytes.is_empty() {
+                        None
+                    } else {
+                        Some(BufferOverride {
+                            bytes: STANDARD.decode(bytes)?,
+                            stored: false,
+                            memory_size: 0,
+                        })
+                    }
                 } else if let Some(bytes) = object.get("StoredBytes").and_then(Value::as_str) {
                     Some(BufferOverride {
                         bytes: STANDARD.decode(bytes)?,
@@ -1853,18 +2301,120 @@ fn collect_buffer_overrides(
     Ok(())
 }
 
-fn collect_redpackage_overrides(
-    value: &Value,
+fn remap_buffer_overrides(
+    overrides: &mut HashMap<usize, BufferOverride>,
     file: &Cr2wInspection,
     template: &[u8],
-    classes: &BTreeSet<String>,
     kraken_path: &OsStr,
+) -> Result<(), WriterError> {
+    let mut pending = std::mem::take(overrides).into_iter().collect::<Vec<_>>();
+    pending.sort_by_key(|(index, _)| *index);
+    let uncompressed = (0..file.buffers.len())
+        .map(|index| uncompressed_template_buffer(file, template, index, kraken_path).ok())
+        .collect::<Vec<_>>();
+    let mut claimed = HashSet::new();
+    for (requested, replacement) in pending {
+        let mut candidates = Vec::new();
+        for (index, buffer) in file.buffers.iter().enumerate() {
+            let matches = if replacement.stored {
+                let start = usize::try_from(buffer.offset).map_err(|_| WriterError::TooLarge)?;
+                let size = usize::try_from(buffer.disk_size).map_err(|_| WriterError::TooLarge)?;
+                start
+                    .checked_add(size)
+                    .and_then(|end| template.get(start..end))
+                    == Some(replacement.bytes.as_slice())
+            } else {
+                uncompressed[index]
+                    .as_ref()
+                    .is_some_and(|bytes| bytes.as_slice() == replacement.bytes.as_slice())
+            };
+            if matches {
+                candidates.push(index);
+            }
+        }
+        let Some(target) = candidates
+            .iter()
+            .copied()
+            .find(|index| *index == requested && !claimed.contains(index))
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|index| !claimed.contains(index))
+            })
+        else {
+            continue;
+        };
+        claimed.insert(target);
+        overrides.insert(target, replacement);
+    }
+    Ok(())
+}
+
+fn redpackage_ordinal_map(expected: &Value, template: &Value) -> HashMap<usize, usize> {
+    fn collect(expected: &Value, template: &Value, result: &mut HashMap<usize, usize>) {
+        match (expected, template) {
+            (Value::Array(expected), Value::Array(template)) => {
+                for (expected, template) in expected.iter().zip(template) {
+                    collect(expected, template, result);
+                }
+            }
+            (Value::Object(expected), Value::Object(template)) => {
+                let expected_is_package = expected
+                    .get("Type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.contains("RedPackage"));
+                let template_is_package = template
+                    .get("Type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.contains("RedPackage"));
+                if expected_is_package && template_is_package {
+                    let expected_id = expected
+                        .get("BufferId")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.parse::<usize>().ok());
+                    let template_id = template
+                        .get("BufferId")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.parse::<usize>().ok());
+                    if let (Some(expected_id), Some(template_id)) = (expected_id, template_id) {
+                        result.entry(expected_id).or_insert(template_id);
+                    }
+                    return;
+                }
+                for (key, expected) in expected {
+                    if let Some(template) = template.get(key) {
+                        collect(expected, template, result);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut result = HashMap::new();
+    collect(expected, template, &mut result);
+    result
+}
+
+struct RedPackageContext<'a> {
+    file: &'a Cr2wInspection,
+    template: &'a [u8],
+    classes: &'a BTreeSet<String>,
+    kraken_path: &'a OsStr,
+    ordinals: &'a HashMap<usize, usize>,
+}
+
+fn collect_redpackage_overrides(
+    value: &Value,
+    context: &RedPackageContext<'_>,
     result: &mut HashMap<usize, BufferOverride>,
+    claimed: &mut HashSet<usize>,
 ) -> Result<(), WriterError> {
     match value {
         Value::Array(values) => {
             for value in values {
-                collect_redpackage_overrides(value, file, template, classes, kraken_path, result)?;
+                collect_redpackage_overrides(value, context, result, claimed)?;
             }
         }
         Value::Object(object) => {
@@ -1881,24 +2431,29 @@ fn collect_redpackage_overrides(
                 let data = object
                     .get("Data")
                     .ok_or_else(|| unsupported("RedPackage Data"))?;
-                let (index, template_package) = resolve_redpackage_template_buffer(
-                    file,
-                    template,
+                let Ok((index, template_package)) = resolve_redpackage_template_buffer(
+                    context,
                     index,
                     data,
-                    classes,
-                    kraken_path,
-                )?;
+                    claimed,
+                    context.ordinals.get(&index).copied(),
+                ) else {
+                    // Unsupported package variants remain lossless because the
+                    // top-level template buffer is retained unchanged.
+                    return Ok(());
+                };
                 let imports_as_hash = redpackage::imports_are_hashed(&template_package)?;
-                let bytes = redpackage::encode_with_template(
+                let Ok(bytes) = redpackage::encode_with_template(
                     &template_package,
                     data,
-                    classes,
+                    context.classes,
                     PackageSettings {
                         imports_as_hash,
                         handle_id_base: 0,
                     },
-                )?;
+                ) else {
+                    return Ok(());
+                };
                 result.insert(
                     index,
                     BufferOverride {
@@ -1907,10 +2462,11 @@ fn collect_redpackage_overrides(
                         memory_size: 0,
                     },
                 );
+                claimed.insert(index);
                 return Ok(());
             }
             for child in object.values() {
-                collect_redpackage_overrides(child, file, template, classes, kraken_path, result)?;
+                collect_redpackage_overrides(child, context, result, claimed)?;
             }
         }
         _ => {}
@@ -1919,25 +2475,38 @@ fn collect_redpackage_overrides(
 }
 
 fn resolve_redpackage_template_buffer(
-    file: &Cr2wInspection,
-    template: &[u8],
+    context: &RedPackageContext<'_>,
     requested_index: usize,
     data: &Value,
-    classes: &BTreeSet<String>,
-    kraken_path: &OsStr,
+    claimed: &HashSet<usize>,
+    aligned_ordinal: Option<usize>,
 ) -> Result<(usize, Vec<u8>), WriterError> {
     let expected_roots = redpackage_root_types(data);
+    let mut packages = Vec::new();
+    for index in 0..context.file.buffers.len() {
+        let Ok(bytes) = uncompressed_template_buffer(
+            context.file,
+            context.template,
+            index,
+            context.kraken_path,
+        ) else {
+            continue;
+        };
+        if redpackage::imports_are_hashed(&bytes).is_err() {
+            continue;
+        }
+        packages.push((index, bytes));
+    }
+    if let Some(aligned) = aligned_ordinal.and_then(|ordinal| packages.get(ordinal)) {
+        return Ok(aligned.clone());
+    }
+
     let mut matches = Vec::new();
-    for index in 0..file.buffers.len() {
-        let Ok(bytes) = uncompressed_template_buffer(file, template, index, kraken_path) else {
-            continue;
-        };
-        let Ok(imports_as_hash) = redpackage::imports_are_hashed(&bytes) else {
-            continue;
-        };
+    for (index, bytes) in &packages {
+        let imports_as_hash = redpackage::imports_are_hashed(bytes)?;
         let Ok(decoded) = redpackage::decode(
-            &bytes,
-            classes,
+            bytes,
+            context.classes,
             PackageSettings {
                 imports_as_hash,
                 handle_id_base: 0,
@@ -1946,20 +2515,63 @@ fn resolve_redpackage_template_buffer(
             continue;
         };
         if redpackage_root_types(&decoded) == expected_roots {
-            matches.push((index, bytes));
+            matches.push((
+                *index,
+                bytes.clone(),
+                semantic_overlap_score(data, &decoded),
+            ));
         }
     }
-    if let Some(position) = matches
-        .iter()
-        .position(|(index, _)| *index == requested_index)
+    let ordinal_index = packages.get(requested_index).map(|(index, _)| *index);
+    if !matches.is_empty() {
+        let position = select_redpackage_match(&matches, ordinal_index, claimed);
+        let (index, bytes, _) = matches.swap_remove(position);
+        return Ok((index, bytes));
+    }
+    if let Some(index) = ordinal_index
+        && let Some(position) = packages
+            .iter()
+            .position(|(candidate, _)| *candidate == index)
     {
-        return Ok(matches.swap_remove(position));
+        return Ok(packages.swap_remove(position));
     }
-    match matches.as_mut_slice() {
-        [candidate] => Ok((candidate.0, std::mem::take(&mut candidate.1))),
-        [] => Err(unsupported("RedPackage template buffer not found")),
-        _ => Err(unsupported("RedPackage template buffer is ambiguous")),
-    }
+    Err(unsupported("RedPackage template buffer not found"))
+}
+
+fn select_redpackage_match(
+    matches: &[(usize, Vec<u8>, i64)],
+    ordinal: Option<usize>,
+    claimed: &HashSet<usize>,
+) -> usize {
+    let best_score = matches
+        .iter()
+        .map(|(_, _, score)| *score)
+        .max()
+        .expect("non-empty matches have a score");
+    ordinal
+        .and_then(|ordinal| {
+            matches.iter().position(|(index, _, score)| {
+                *index == ordinal && *score == best_score && !claimed.contains(index)
+            })
+        })
+        .or_else(|| {
+            matches
+                .iter()
+                .position(|(index, _, score)| *score == best_score && !claimed.contains(index))
+        })
+        .or_else(|| {
+            ordinal.and_then(|ordinal| {
+                matches
+                    .iter()
+                    .position(|(index, _, score)| *index == ordinal && *score == best_score)
+            })
+        })
+        .or_else(|| {
+            matches
+                .iter()
+                .position(|(_, _, score)| *score == best_score)
+        })
+        .expect("the maximum score came from a match")
 }
 
 fn redpackage_root_types(data: &Value) -> Vec<&str> {
@@ -1969,6 +2581,77 @@ fn redpackage_root_types(data: &Value) -> Vec<&str> {
         .flatten()
         .filter_map(|chunk| chunk.get("$type").and_then(Value::as_str))
         .collect()
+}
+
+fn semantic_overlap_score(expected: &Value, actual: &Value) -> i64 {
+    match (expected, actual) {
+        (Value::Object(expected), Value::Object(actual)) => {
+            let overlap = actual
+                .iter()
+                .filter(|(key, _)| !is_ignored_semantic_key(key))
+                .filter_map(|(key, actual)| {
+                    expected
+                        .get(key)
+                        .map(|expected| semantic_overlap_score(expected, actual))
+                })
+                .sum::<i64>();
+            let omitted_defaults = expected
+                .iter()
+                .filter(|(key, _)| !is_ignored_semantic_key(key))
+                .filter(|(key, _)| !actual.contains_key(*key))
+                .map(|(_, expected)| omitted_default_score(expected))
+                .sum::<i64>();
+            overlap + omitted_defaults
+        }
+        (Value::Array(expected), Value::Array(actual)) => expected
+            .iter()
+            .zip(actual)
+            .map(|(expected, actual)| semantic_overlap_score(expected, actual))
+            .sum(),
+        (Value::Number(expected), Value::Number(actual))
+            if expected.as_f64() == actual.as_f64() =>
+        {
+            1
+        }
+        (expected, actual) if expected == actual => 1,
+        _ => -1,
+    }
+}
+
+fn is_ignored_semantic_key(key: &str) -> bool {
+    matches!(
+        key,
+        "HandleId" | "HandleRefId" | "BufferId" | "$rawData" | "$rawTail"
+    )
+}
+
+fn omitted_default_score(value: &Value) -> i64 {
+    let Value::Object(object) = value else {
+        return 0;
+    };
+    let Some(default) = object.get("$value").and_then(Value::as_str) else {
+        return 0;
+    };
+    if !default.eq_ignore_ascii_case("default") {
+        return 0;
+    }
+    object
+        .iter()
+        .filter(|(key, _)| !is_ignored_semantic_key(key))
+        .map(|(_, value)| semantic_leaf_count(value))
+        .sum()
+}
+
+fn semantic_leaf_count(value: &Value) -> i64 {
+    match value {
+        Value::Array(values) => values.iter().map(semantic_leaf_count).sum(),
+        Value::Object(object) => object
+            .iter()
+            .filter(|(key, _)| !is_ignored_semantic_key(key))
+            .map(|(_, value)| semantic_leaf_count(value))
+            .sum(),
+        _ => 1,
+    }
 }
 
 fn uncompressed_template_buffer(
@@ -1998,9 +2681,6 @@ fn uncompressed_template_buffer(
             .try_into()
             .map_err(|_| unsupported("RedPackage KARK header"))?,
     );
-    if declared != buffer.memory_size {
-        return Err(unsupported("RedPackage KARK memory size"));
-    }
     Ok(archive::decompress_payload_isolated(
         stored
             .get(8..)
@@ -2153,7 +2833,6 @@ fn node_ref_hash_without_aliases(value: &str) -> u64 {
 
 fn buffer_matches(
     stored: &[u8],
-    memory_size: u32,
     replacement: &[u8],
     kraken_path: &OsStr,
 ) -> Result<bool, WriterError> {
@@ -2167,17 +2846,13 @@ fn buffer_matches(
             .try_into()
             .map_err(|_| unsupported("KARK header"))?,
     );
-    if declared != memory_size {
-        return Err(unsupported("KARK memory size"));
-    }
     match archive::decompress_payload_isolated(
         &stored[8..],
         usize::try_from(declared).map_err(|_| WriterError::TooLarge)?,
         kraken_path,
     ) {
         Ok(bytes) => Ok(bytes == replacement),
-        // Some base-game buffers require Oodle rather than the fallback
-        // Kraken DLL. Preserve them when no compatible decoder is available.
+        // Preserve the template if the native decoder cannot compare it.
         Err(_) => Ok(false),
     }
 }
@@ -2232,6 +2907,13 @@ fn encode_string(value: &str) -> Result<Vec<u8>, WriterError> {
     Ok(output)
 }
 
+fn encode_string_with_template(value: &str, template: &[u8]) -> Result<Vec<u8>, WriterError> {
+    if value.is_empty() && matches!(template, [0 | 0x80]) {
+        return Ok(template.to_vec());
+    }
+    encode_string(value)
+}
+
 fn write_negative_vlq(output: &mut Vec<u8>, value: u32) {
     let mut remaining = value;
     let low = u8::try_from(remaining & 0x3f).expect("masked to six bits");
@@ -2259,7 +2941,7 @@ fn write_positive_vlq(output: &mut Vec<u8>, value: u32) {
 fn fixed_size(red_type: &str) -> Option<usize> {
     match red_type {
         "Bool" | "Int8" | "Uint8" => Some(1),
-        "Int16" | "Uint16" | "CName" => Some(2),
+        "Int16" | "Uint16" | "CName" | "serializationDeferredDataBuffer" => Some(2),
         "Int32" | "Uint32" | "Float" => Some(4),
         "Int64"
         | "Uint64"
@@ -2274,11 +2956,116 @@ fn fixed_size(red_type: &str) -> Option<usize> {
     }
 }
 
+fn is_opaque_custom_data(red_type: &str) -> bool {
+    matches!(
+        red_type,
+        "Variant"
+            | "AITrafficWorkspotCompiled"
+            | "animAnimationBufferCompressed"
+            | "gameCompiledSmartObjectData"
+            | "gameSmartObjectAnimationDatabase"
+            | "worldCompiledEffectInfo"
+    )
+}
+
+fn is_opaque_appendix(red_type: &str) -> bool {
+    matches!(
+        red_type,
+        "animRig"
+            | "C2dArray"
+            | "CMaterialTemplate"
+            | "CPhysicsDecorationResource"
+            | "gameLocationResource"
+            | "gameLootResourceData"
+            | "meshMeshParamSpeedTreeWind"
+            | "physicsColliderMesh"
+            | "physicsMaterialLibraryResource"
+            | "scnAnimName"
+            | "worldInstancedMeshNode"
+            | "worldInstancedOccluderNode"
+            | "worldTrafficCompiledNode"
+            | "worldTrafficLanesSpotsResource"
+            | "worldTrafficPersistentLaneConnectionsResource"
+            | "worldTrafficPersistentLanePolygonResource"
+            | "worldTrafficPersistentResource"
+            | "worldTrafficPersistentSpatialResource"
+    )
+}
+
+fn split_fixed_array_type(value: &str) -> Option<(usize, &str)> {
+    let value = value.strip_prefix('[')?;
+    let (count, inner) = value.split_once(']')?;
+    (!inner.is_empty()).then_some((count.parse().ok()?, inner))
+}
+
+fn interpolation_type_value(value: &str) -> Option<u8> {
+    [
+        "Constant",
+        "Linear",
+        "BezierQuadratic",
+        "BezierCubic",
+        "Hermite",
+    ]
+    .iter()
+    .position(|candidate| *candidate == value)
+    .and_then(|value| u8::try_from(value).ok())
+}
+
+fn segment_link_type_value(value: &str) -> Option<u8> {
+    ["ESLT_Normal", "ESLT_Smooth", "ESLT_SmoothSymmetric"]
+        .iter()
+        .position(|candidate| *candidate == value)
+        .and_then(|value| u8::try_from(value).ok())
+}
+
+fn channel_link_type_value(value: &str) -> Option<u8> {
+    ["Normal", "Smooth", "SmoothSymmertric"]
+        .iter()
+        .position(|candidate| *candidate == value)
+        .and_then(|value| u8::try_from(value).ok())
+}
+
+fn encode_fixed_curve_class(value: &Value, red_type: &str) -> Result<Option<Vec<u8>>, WriterError> {
+    let properties: &[&str] = match red_type {
+        "Vector2" => &["X", "Y"],
+        "Vector3" => &["X", "Y", "Z"],
+        "Vector4" => &["X", "Y", "Z", "W"],
+        "HDRColor" => &["Red", "Green", "Blue", "Alpha"],
+        _ => return Ok(None),
+    };
+    let mut output = Vec::with_capacity(properties.len() * 4);
+    for property in properties {
+        output.extend_from_slice(
+            &json_f32(
+                value
+                    .get(*property)
+                    .ok_or_else(|| unsupported(format!("{red_type}.{property}")))?,
+            )?
+            .to_le_bytes(),
+        );
+    }
+    Ok(Some(output))
+}
+
 fn storage_value(value: &Value) -> Result<&str, WriterError> {
     value
         .get("$value")
         .and_then(Value::as_str)
         .ok_or_else(|| unsupported("storage value"))
+}
+
+fn node_ref_value(value: &Value) -> Result<&str, WriterError> {
+    let stored = storage_value(value)?;
+    if stored == "0"
+        && value
+            .get("$storage")
+            .and_then(Value::as_str)
+            .is_some_and(|storage| storage == "uint64")
+    {
+        Ok("")
+    } else {
+        Ok(stored)
+    }
 }
 
 fn storage_or_string(value: &Value) -> Result<&str, WriterError> {
@@ -2312,7 +3099,15 @@ fn json_u64(value: &Value) -> Result<u64, WriterError> {
 }
 
 fn json_f64(value: &Value) -> Result<f64, WriterError> {
-    value.as_f64().ok_or_else(|| unsupported("float value"))
+    if let Some(value) = value.as_f64() {
+        return Ok(value);
+    }
+    match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("inf" | "+inf" | "infinity" | "+infinity") => Ok(f64::INFINITY),
+        Some("-inf" | "-infinity") => Ok(f64::NEG_INFINITY),
+        Some("nan" | "+nan" | "-nan") => Ok(f64::NAN),
+        _ => Err(unsupported("float value")),
+    }
 }
 
 #[allow(
@@ -2354,11 +3149,15 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        area_shape_outline_buffer, class_property, collect_handle_ids, compact_export_indices,
-        encode_device_data_entry, handle_identity, is_default_missing_value, json_bool,
-        normalize_wolvenkit_enum_name, red_type_from_cs, write_positive_vlq, write_with_template,
+        area_shape_outline_buffer, buffer_matches, channel_link_type_value, class_property,
+        collect_handle_ids, compact_export_indices, encode_device_data_entry,
+        encode_string_with_template, handle_identity, interpolation_type_value,
+        is_default_missing_value, json_bool, json_f32, node_ref_value,
+        normalize_wolvenkit_enum_name, read_json, red_type_from_cs, redpackage_ordinal_map,
+        segment_link_type_value, select_redpackage_match, semantic_overlap_score,
+        split_fixed_array_type, write_positive_vlq, write_with_template,
     };
-    use crate::{codec, cr2w, schema};
+    use crate::{codec, cr2w, kraken, schema};
     use serde_json::{Value, json};
     use std::{
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -2383,12 +3182,105 @@ mod tests {
     }
 
     #[test]
+    fn reads_deep_wolvenkit_json() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("deep.json");
+        let depth = 256;
+        let json = format!("{}null{}", "[".repeat(depth), "]".repeat(depth));
+        fs::write(&path, json).unwrap();
+
+        assert!(read_json(&path).is_ok());
+    }
+
+    #[test]
+    fn compares_kark_buffers_using_the_header_size() {
+        let replacement = b"repeated native kraken buffer repeated native kraken buffer";
+        let payload = kraken::encode(replacement);
+        let mut stored = b"KARK".to_vec();
+        stored.extend_from_slice(&u32::try_from(replacement.len()).unwrap().to_le_bytes());
+        stored.extend_from_slice(&payload);
+
+        assert!(buffer_matches(&stored, replacement, OsStr::new("missing-kraken.dll")).unwrap());
+    }
+
+    #[test]
+    fn parses_wolvenkit_non_finite_floats() {
+        let negative = json_f32(&Value::String("-inf".to_owned())).unwrap();
+        assert!(negative.is_infinite() && negative.is_sign_negative());
+        let positive = json_f32(&Value::String("+inf".to_owned())).unwrap();
+        assert!(positive.is_infinite() && positive.is_sign_positive());
+        assert!(json_f32(&Value::String("nan".to_owned())).unwrap().is_nan());
+        assert!(json_f32(&Value::String("not-a-float".to_owned())).is_err());
+    }
+
+    #[test]
+    fn preserves_both_valid_empty_string_encodings() {
+        assert_eq!(encode_string_with_template("", &[0]).unwrap(), [0]);
+        assert_eq!(encode_string_with_template("", &[0x80]).unwrap(), [0x80]);
+        assert_eq!(
+            encode_string_with_template("text", &[0]).unwrap(),
+            [0x84, b't', b'e', b'x', b't']
+        );
+    }
+
+    #[test]
+    fn maps_hashed_zero_node_ref_to_an_empty_string() {
+        let value = json!({
+            "$type": "NodeRef",
+            "$storage": "uint64",
+            "$value": "0"
+        });
+
+        assert_eq!(node_ref_value(&value).unwrap(), "");
+    }
+
+    #[test]
     fn wolvenkit_boolean_enum_names_map_to_red_names() {
         assert_eq!(normalize_wolvenkit_enum_name("true_"), "true");
         assert_eq!(normalize_wolvenkit_enum_name("false_"), "false");
         assert_eq!(
             normalize_wolvenkit_enum_name("default__false_"),
             "default__false_"
+        );
+    }
+
+    #[test]
+    fn parses_fixed_array_type() {
+        assert_eq!(split_fixed_array_type("[6]Float"), Some((6, "Float")));
+        assert_eq!(split_fixed_array_type("static:6,Float"), None);
+    }
+
+    #[test]
+    fn maps_legacy_curve_enums() {
+        assert_eq!(interpolation_type_value("BezierQuadratic"), Some(2));
+        assert_eq!(segment_link_type_value("ESLT_SmoothSymmetric"), Some(2));
+        assert_eq!(channel_link_type_value("SmoothSymmertric"), Some(2));
+        assert_eq!(interpolation_type_value("Unknown"), None);
+        assert_eq!(segment_link_type_value("Unknown"), None);
+        assert_eq!(channel_link_type_value("Unknown"), None);
+    }
+
+    #[test]
+    fn semantic_overlap_prefers_matching_sparse_template() {
+        let expected = serde_json::json!({
+            "$type": "Chunk",
+            "defaultOnly": 10,
+            "value": "wanted",
+            "HandleId": "0"
+        });
+        let matching = serde_json::json!({
+            "$type": "Chunk",
+            "value": "wanted",
+            "HandleId": "42"
+        });
+        let other = serde_json::json!({
+            "$type": "Chunk",
+            "value": "other",
+            "HandleId": "0"
+        });
+        assert!(
+            semantic_overlap_score(&expected, &matching)
+                > semantic_overlap_score(&expected, &other)
         );
     }
 
@@ -2436,8 +3328,14 @@ mod tests {
                         schema::RedProperty {
                             cs_type: "CBool".to_owned(),
                             ordinal: Some(0),
+                            red_type: None,
+                            offset: None,
+                            flags: None,
                         },
                     )]),
+                    flags: None,
+                    size: None,
+                    alignment: None,
                 },
             ),
             (
@@ -2445,6 +3343,9 @@ mod tests {
                 schema::RedClass {
                     base: Some("Base".to_owned()),
                     properties: std::collections::BTreeMap::new(),
+                    flags: None,
+                    size: None,
+                    alignment: None,
                 },
             ),
         ]);
@@ -2544,6 +3445,60 @@ mod tests {
         );
         assert!(
             (f32::from_le_bytes(encoded[36..40].try_into().unwrap()) - 5.174_843).abs() < 0.001
+        );
+    }
+
+    #[test]
+    fn semantic_overlap_treats_omitted_red_value_as_explicit_default() {
+        let expected = serde_json::json!({
+            "$type": "Chunk",
+            "meshAppearance": {
+                "$type": "CName",
+                "$storage": "string",
+                "$value": "default"
+            }
+        });
+        let omitted_default = serde_json::json!({
+            "$type": "Chunk"
+        });
+        let non_default = serde_json::json!({
+            "$type": "Chunk",
+            "meshAppearance": {
+                "$type": "CName",
+                "$storage": "string",
+                "$value": "thermal"
+            }
+        });
+        assert!(
+            semantic_overlap_score(&expected, &omitted_default)
+                > semantic_overlap_score(&expected, &non_default)
+        );
+    }
+
+    #[test]
+    fn redpackage_match_prefers_an_unclaimed_best_template() {
+        let matches = vec![(3, vec![], 10), (7, vec![], 10), (9, vec![], 8)];
+        let claimed = HashSet::from([3]);
+        assert_eq!(select_redpackage_match(&matches, Some(3), &claimed), 1);
+    }
+
+    #[test]
+    fn redpackage_ordinals_follow_matching_outer_structure() {
+        let expected = serde_json::json!({
+            "appearances": [
+                {"compiledData": {"Type": "DataBuffer (RedPackage)", "BufferId": "0"}},
+                {"compiledData": {"Type": "DataBuffer (RedPackage)", "BufferId": "1"}}
+            ]
+        });
+        let template = serde_json::json!({
+            "appearances": [
+                {"compiledData": {"Type": "DataBuffer (RedPackage)", "BufferId": "7"}},
+                {"compiledData": {"Type": "DataBuffer (RedPackage)", "BufferId": "3"}}
+            ]
+        });
+        assert_eq!(
+            redpackage_ordinal_map(&expected, &template),
+            HashMap::from([(0, 7), (1, 3)])
         );
     }
 
