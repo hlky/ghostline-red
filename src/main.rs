@@ -15,21 +15,51 @@ use std::{
 use tempfile::NamedTempFile;
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MeshExportBatchManifest {
     jobs: Vec<MeshExportBatchJob>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct MeshExportBatchJob {
     mesh: String,
-    appearance: String,
+    #[serde(default)]
+    appearance: Option<String>,
     output: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
 struct MeshExportBatchOutcome {
     mesh: String,
-    appearance: String,
+    appearance: Option<String>,
+    output: PathBuf,
+    error: Option<String>,
+    material_error: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MeshExportBatchErrors {
+    error: Option<String>,
+    material_error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Cr2wSerializeBatchManifest {
+    jobs: Vec<Cr2wSerializeBatchJob>,
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct Cr2wSerializeBatchJob {
+    resource: String,
+    output: PathBuf,
+}
+
+#[derive(Debug, Serialize)]
+struct Cr2wSerializeBatchOutcome {
+    resource: String,
     output: PathBuf,
     error: Option<String>,
 }
@@ -119,6 +149,22 @@ enum Command {
         #[arg(long, required = true)]
         schema: Vec<PathBuf>,
         output: PathBuf,
+    },
+    /// Serialize many archive-backed CR2W resources while indexing archives once.
+    Cr2wSerializeBatch {
+        manifest: PathBuf,
+        /// Schema sources in increasing precedence order.
+        #[arg(long, required = true)]
+        schema: Vec<PathBuf>,
+        /// Root containing the game's content, expansion, hotfix, and mod archives.
+        #[arg(long)]
+        archives_root: PathBuf,
+        /// Machine-readable per-job outcome report.
+        #[arg(long)]
+        report: PathBuf,
+        /// Concurrent serialization jobs; zero uses all available logical CPUs.
+        #[arg(long, default_value_t = 0)]
+        threads: usize,
     },
     /// Deserialize WKit-shaped JSON using an existing CR2W table/layout template.
     Cr2wDeserialize {
@@ -377,6 +423,66 @@ fn main() -> Result<()> {
                 codec::decode_wkit_with_red_schema(&input, &schema, cli.kraken.as_os_str())?;
             fs::write(output, serde_json::to_vec_pretty(&document)?)?;
         }
+        Command::Cr2wSerializeBatch {
+            manifest,
+            schema,
+            archives_root,
+            report,
+            threads,
+        } => {
+            let schema = load_schemas(&schema)?;
+            let manifest: Cr2wSerializeBatchManifest = serde_json::from_slice(
+                &fs::read(&manifest)
+                    .with_context(|| format!("failed to read manifest {}", manifest.display()))?,
+            )
+            .with_context(|| format!("failed to parse manifest {}", manifest.display()))?;
+            let archives = material::ArchiveSet::open(&archives_root)?;
+            let job_count = manifest.jobs.len();
+            let thread_count = if threads == 0 {
+                std::thread::available_parallelism().map_or(1, usize::from)
+            } else {
+                threads
+            };
+            eprintln!("serializing {job_count} CR2W resources with {thread_count} threads");
+            let pool = ThreadPoolBuilder::new().num_threads(thread_count).build()?;
+            let completed = AtomicUsize::new(0);
+            let outcomes = pool.install(|| {
+                manifest
+                    .jobs
+                    .into_par_iter()
+                    .map(|job| {
+                        let result = serialize_archive_resource(
+                            &job,
+                            &schema,
+                            &archives,
+                            cli.kraken.as_os_str(),
+                        );
+                        let position = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                        eprintln!("[{position}/{job_count}] {}", job.resource);
+                        Cr2wSerializeBatchOutcome {
+                            resource: job.resource,
+                            output: job.output,
+                            error: result.err().map(|error| format!("{error:#}")),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            write_json_atomic(&report, &outcomes)?;
+            let failures = outcomes
+                .iter()
+                .filter(|outcome| outcome.error.is_some())
+                .count();
+            println!(
+                "completed {} CR2W serializations with {failures} failures",
+                outcomes.len()
+            );
+            if failures > 0 {
+                anyhow::bail!(
+                    "{failures} CR2W serialization jobs failed; see {}",
+                    report.display()
+                );
+            }
+        }
         Command::Cr2wDeserialize {
             input,
             template,
@@ -457,6 +563,7 @@ fn main() -> Result<()> {
         } => {
             let schema = load_schemas(&schema)?;
             let manifest: MeshExportBatchManifest = serde_json::from_slice(&fs::read(&manifest)?)?;
+            validate_mesh_export_batch_outputs(&manifest.jobs)?;
             let archives = material::ArchiveSet::open(&archives_root)?;
             let job_count = manifest.jobs.len();
             let thread_count = if threads == 0 {
@@ -467,64 +574,65 @@ fn main() -> Result<()> {
             eprintln!("exporting {job_count} jobs with {thread_count} threads");
             let pool = ThreadPoolBuilder::new().num_threads(thread_count).build()?;
             let completed = AtomicUsize::new(0);
+            let fatal_completed = AtomicUsize::new(0);
+            let material_warnings_completed = AtomicUsize::new(0);
             let outcomes = pool.install(|| {
                 manifest
                     .jobs
                     .into_par_iter()
                     .map(|job| {
-                        let result = (|| -> Result<()> {
-                            let bytes =
-                                archives.read_resource(&job.mesh, cli.kraken.as_os_str())?;
-                            let mut input = NamedTempFile::new()?;
-                            input.write_all(&bytes)?;
-                            mesh::export_glb(
-                                input.path(),
-                                &schema,
-                                &job.output,
-                                cli.kraken.as_os_str(),
-                                true,
-                            )?;
-                            let sidecar = job.output.with_extension("Material.json");
-                            material::export_mesh_materials(
-                                input.path(),
-                                &schema,
-                                &archives,
-                                &material_repo,
-                                &sidecar,
-                                cli.kraken.as_os_str(),
-                                Some(&job.appearance),
-                            )?;
-                            if pbr {
-                                pbr::bake_sidecar_into_glb(
-                                    &sidecar,
-                                    &job.output,
-                                    &job.appearance,
-                                    Some(pbr_size),
-                                )?;
-                            }
-                            Ok(())
-                        })();
+                        let errors = run_mesh_export_batch_job(
+                            &job,
+                            &schema,
+                            &archives,
+                            &material_repo,
+                            cli.kraken.as_os_str(),
+                            pbr,
+                            pbr_size,
+                        );
+                        let is_fatal = errors.error.is_some();
+                        let has_material_warning = errors.material_error.is_some();
+                        let fatal_count = if is_fatal {
+                            fatal_completed.fetch_add(1, Ordering::Relaxed) + 1
+                        } else {
+                            fatal_completed.load(Ordering::Relaxed)
+                        };
+                        let material_warning_count = if has_material_warning {
+                            material_warnings_completed.fetch_add(1, Ordering::Relaxed) + 1
+                        } else {
+                            material_warnings_completed.load(Ordering::Relaxed)
+                        };
                         let position = completed.fetch_add(1, Ordering::Relaxed) + 1;
-                        eprintln!("[{position}/{job_count}] {} ({})", job.mesh, job.appearance);
+                        let is_first_problem = (is_fatal && fatal_count == 1)
+                            || (has_material_warning && material_warning_count == 1);
+                        if should_report_batch_progress(position, job_count) || is_first_problem {
+                            let appearance = job.appearance.as_deref().unwrap_or("all appearances");
+                            let status = match (is_fatal, has_material_warning) {
+                                (true, _) => "failed",
+                                (false, true) => "material warning",
+                                (false, false) => "complete",
+                            };
+                            eprintln!(
+                                "[{position}/{job_count}] {status}: {} ({appearance}); \
+                                 {fatal_count} fatal, {material_warning_count} material warnings",
+                                job.mesh
+                            );
+                        }
                         MeshExportBatchOutcome {
                             mesh: job.mesh,
                             appearance: job.appearance,
                             output: job.output,
-                            error: result.err().map(|error| format!("{error:#}")),
+                            error: errors.error,
+                            material_error: errors.material_error,
                         }
                     })
                     .collect::<Vec<_>>()
             });
-            if let Some(parent) = report.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&report, serde_json::to_vec_pretty(&outcomes)?)?;
-            let failures = outcomes
-                .iter()
-                .filter(|outcome| outcome.error.is_some())
-                .count();
+            write_json_atomic(&report, &outcomes)?;
+            let (failures, material_warnings) = mesh_export_batch_outcome_counts(&outcomes);
             println!(
-                "completed {} mesh exports with {failures} failures",
+                "completed {} mesh exports with {failures} failures and {material_warnings} \
+                 material warnings",
                 outcomes.len()
             );
             if failures > 0 {
@@ -588,4 +696,417 @@ fn load_schemas(paths: &[PathBuf]) -> Result<schema::RedSchema> {
         );
     }
     Ok(result)
+}
+
+fn run_mesh_export_batch_job(
+    job: &MeshExportBatchJob,
+    schema: &schema::RedSchema,
+    archives: &material::ArchiveSet,
+    material_repo: &Path,
+    kraken_path: &std::ffi::OsStr,
+    pbr: bool,
+    pbr_size: u32,
+) -> MeshExportBatchErrors {
+    let geometry = (|| -> Result<NamedTempFile> {
+        let bytes = archives
+            .read_resource(&job.mesh, kraken_path)
+            .with_context(|| format!("failed to read archive mesh {}", job.mesh))?;
+        let mut input = NamedTempFile::new()
+            .with_context(|| format!("failed to create temporary input for {}", job.mesh))?;
+        input
+            .write_all(&bytes)
+            .with_context(|| format!("failed to stage archive mesh {}", job.mesh))?;
+        mesh::export_glb(input.path(), schema, &job.output, kraken_path, true)
+            .with_context(|| format!("failed to export GLB for {}", job.mesh))?;
+        Ok(input)
+    })();
+    let input = match geometry {
+        Ok(input) => input,
+        Err(error) => return fatal_mesh_export_error(&error),
+    };
+
+    let sidecar = job.output.with_extension("Material.json");
+    let material_result = (|| -> Result<()> {
+        material::export_mesh_materials(
+            input.path(),
+            schema,
+            archives,
+            material_repo,
+            &sidecar,
+            kraken_path,
+            job.appearance.as_deref(),
+        )
+        .with_context(|| format!("failed to export material sidecar for {}", job.mesh))?;
+        Ok(())
+    })();
+    if let Err(error) = material_result {
+        return classify_material_export_error(&error, &sidecar, pbr);
+    }
+
+    if pbr {
+        let bake_result = (|| -> Result<()> {
+            let appearance = job
+                .appearance
+                .as_deref()
+                .context("batch --pbr requires an explicit appearance")?;
+            pbr::bake_sidecar_into_glb(&sidecar, &job.output, appearance, Some(pbr_size))
+                .with_context(|| format!("failed to bake PBR materials for {}", job.mesh))?;
+            Ok(())
+        })();
+        if let Err(error) = bake_result {
+            return fatal_mesh_export_error(&error);
+        }
+    }
+
+    MeshExportBatchErrors::default()
+}
+
+fn fatal_mesh_export_error(error: &anyhow::Error) -> MeshExportBatchErrors {
+    MeshExportBatchErrors {
+        error: Some(format!("{error:#}")),
+        material_error: None,
+    }
+}
+
+fn classify_material_export_error(
+    error: &anyhow::Error,
+    sidecar: &Path,
+    pbr: bool,
+) -> MeshExportBatchErrors {
+    let mut message = format!("{error:#}");
+    match fs::remove_file(sidecar) {
+        Ok(()) => {}
+        Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(cleanup_error) => {
+            message = format!(
+                "{message}; failed to remove incomplete material sidecar {}: {cleanup_error}",
+                sidecar.display()
+            );
+        }
+    }
+    if pbr {
+        MeshExportBatchErrors {
+            error: Some(message),
+            material_error: None,
+        }
+    } else {
+        MeshExportBatchErrors {
+            error: None,
+            material_error: Some(message),
+        }
+    }
+}
+
+fn should_report_batch_progress(position: usize, job_count: usize) -> bool {
+    position == 1 || position == job_count || position.is_multiple_of(100)
+}
+
+fn mesh_export_batch_outcome_counts(outcomes: &[MeshExportBatchOutcome]) -> (usize, usize) {
+    outcomes.iter().fold((0, 0), |(fatal, material), outcome| {
+        (
+            fatal + usize::from(outcome.error.is_some()),
+            material + usize::from(outcome.material_error.is_some()),
+        )
+    })
+}
+
+fn validate_mesh_export_batch_outputs(jobs: &[MeshExportBatchJob]) -> Result<()> {
+    let mut claims = HashMap::<String, (usize, &'static str, PathBuf)>::new();
+    for (job_index, job) in jobs.iter().enumerate() {
+        let outputs = [
+            ("GLB", job.output.clone()),
+            (
+                "material sidecar",
+                job.output.with_extension("Material.json"),
+            ),
+        ];
+        for (kind, path) in outputs {
+            let key = mesh_export_output_collision_key(&path)?;
+            if let Some((prior_index, prior_kind, prior_path)) = claims.get(&key) {
+                anyhow::bail!(
+                    "mesh export jobs {} and {} have colliding outputs: {} {} and {} {}",
+                    prior_index + 1,
+                    job_index + 1,
+                    prior_kind,
+                    prior_path.display(),
+                    kind,
+                    path.display()
+                );
+            }
+            claims.insert(key, (job_index, kind, path));
+        }
+    }
+    Ok(())
+}
+
+fn mesh_export_output_collision_key(path: &Path) -> Result<String> {
+    let absolute = std::path::absolute(path)
+        .with_context(|| format!("failed to resolve mesh output path {}", path.display()))?;
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    let key = normalized.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        Ok(key.to_lowercase())
+    } else {
+        Ok(key)
+    }
+}
+
+fn serialize_archive_resource(
+    job: &Cr2wSerializeBatchJob,
+    schema: &schema::RedSchema,
+    archives: &material::ArchiveSet,
+    kraken_path: &std::ffi::OsStr,
+) -> Result<()> {
+    let bytes = archives
+        .read_resource(&job.resource, kraken_path)
+        .with_context(|| format!("failed to read archive resource {}", job.resource))?;
+    let mut input = NamedTempFile::new()
+        .with_context(|| format!("failed to create temporary input for {}", job.resource))?;
+    input
+        .write_all(&bytes)
+        .with_context(|| format!("failed to stage archive resource {}", job.resource))?;
+    input
+        .flush()
+        .with_context(|| format!("failed to flush archive resource {}", job.resource))?;
+    let document = codec::decode_wkit_with_red_schema(input.path(), schema, kraken_path)
+        .with_context(|| format!("failed to serialize archive resource {}", job.resource))?;
+    write_json_atomic(&job.output, &document)
+        .with_context(|| format!("failed to write {}", job.output.display()))
+}
+
+fn write_json_atomic(path: &Path, value: &impl Serialize) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .with_context(|| format!("failed to create output directory {}", parent.display()))?;
+    let mut temporary = NamedTempFile::new_in(parent)
+        .with_context(|| format!("failed to create temporary file beside {}", path.display()))?;
+    serde_json::to_writer_pretty(&mut temporary, value)
+        .with_context(|| format!("failed to encode JSON for {}", path.display()))?;
+    temporary
+        .write_all(b"\n")
+        .with_context(|| format!("failed to finish JSON for {}", path.display()))?;
+    temporary
+        .as_file_mut()
+        .sync_all()
+        .with_context(|| format!("failed to flush JSON for {}", path.display()))?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {} atomically", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_manifest_accepts_job_without_appearance() {
+        let manifest: MeshExportBatchManifest = serde_json::from_str(
+            r#"{"jobs":[{"mesh":"base\\world\\tile.mesh","output":"tile.glb"}]}"#,
+        )
+        .expect("fixture manifest should parse");
+
+        assert!(manifest.jobs[0].appearance.is_none());
+    }
+
+    #[test]
+    fn batch_manifest_should_reject_unknown_top_level_field() {
+        let error = serde_json::from_str::<MeshExportBatchManifest>(
+            r#"{"jobs":[],"continue_on_error":true}"#,
+        )
+        .expect_err("unknown manifest fields should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unknown field `continue_on_error`")
+        );
+    }
+
+    #[test]
+    fn batch_manifest_should_reject_unknown_job_field() {
+        let error = serde_json::from_str::<MeshExportBatchManifest>(
+            r#"{"jobs":[{"mesh":"tile.mesh","output":"tile.glb","lod":0}]}"#,
+        )
+        .expect_err("unknown job fields should be rejected");
+
+        assert!(error.to_string().contains("unknown field `lod`"));
+    }
+
+    #[test]
+    fn batch_outputs_should_reject_lexically_equivalent_glb_paths() {
+        let jobs = vec![
+            mesh_export_test_job("first.mesh", "catalog/tile.glb"),
+            mesh_export_test_job("second.mesh", "catalog/nested/../tile.glb"),
+        ];
+
+        let error = validate_mesh_export_batch_outputs(&jobs)
+            .expect_err("equivalent output paths should be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("jobs 1 and 2 have colliding outputs")
+        );
+    }
+
+    #[test]
+    fn batch_outputs_should_reject_shared_material_sidecar_paths() {
+        let jobs = vec![
+            mesh_export_test_job("first.mesh", "catalog/tile.glb"),
+            mesh_export_test_job("second.mesh", "catalog/tile.gltf"),
+        ];
+
+        let error = validate_mesh_export_batch_outputs(&jobs)
+            .expect_err("shared sidecar paths should be rejected");
+
+        assert!(error.to_string().contains("material sidecar"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn batch_outputs_should_use_case_insensitive_windows_path_semantics() {
+        let jobs = vec![
+            mesh_export_test_job("first.mesh", "catalog/TILE.glb"),
+            mesh_export_test_job("second.mesh", "CATALOG/tile.glb"),
+        ];
+
+        let error = validate_mesh_export_batch_outputs(&jobs)
+            .expect_err("case-only output differences should be rejected on Windows");
+
+        assert!(error.to_string().contains("colliding outputs"));
+    }
+
+    fn mesh_export_test_job(mesh: &str, output: &str) -> MeshExportBatchJob {
+        MeshExportBatchJob {
+            mesh: mesh.to_owned(),
+            appearance: None,
+            output: PathBuf::from(output),
+        }
+    }
+
+    #[test]
+    fn non_pbr_material_failure_should_be_a_warning_and_remove_the_sidecar() {
+        let workspace = tempfile::tempdir().expect("temporary directory should be available");
+        let sidecar = workspace.path().join("tile.Material.json");
+        fs::write(&sidecar, b"incomplete").expect("fixture sidecar should be written");
+
+        let material_error = anyhow::anyhow!("malformed material data");
+        let errors = classify_material_export_error(&material_error, &sidecar, false);
+
+        assert_eq!(
+            (errors, sidecar.exists()),
+            (
+                MeshExportBatchErrors {
+                    error: None,
+                    material_error: Some("malformed material data".to_owned()),
+                },
+                false,
+            )
+        );
+    }
+
+    #[test]
+    fn pbr_material_failure_should_remain_fatal() {
+        let workspace = tempfile::tempdir().expect("temporary directory should be available");
+        let sidecar = workspace.path().join("tile.Material.json");
+
+        let material_error = anyhow::anyhow!("missing texture dependency");
+        let errors = classify_material_export_error(&material_error, &sidecar, true);
+
+        assert_eq!(
+            errors,
+            MeshExportBatchErrors {
+                error: Some("missing texture dependency".to_owned()),
+                material_error: None,
+            }
+        );
+    }
+
+    #[test]
+    fn batch_outcome_counts_should_separate_fatal_failures_and_material_warnings() {
+        let outcomes = vec![
+            MeshExportBatchOutcome {
+                mesh: "complete.mesh".to_owned(),
+                appearance: None,
+                output: PathBuf::from("complete.glb"),
+                error: None,
+                material_error: None,
+            },
+            MeshExportBatchOutcome {
+                mesh: "warning.mesh".to_owned(),
+                appearance: None,
+                output: PathBuf::from("warning.glb"),
+                error: None,
+                material_error: Some("malformed material".to_owned()),
+            },
+            MeshExportBatchOutcome {
+                mesh: "failed.mesh".to_owned(),
+                appearance: None,
+                output: PathBuf::from("failed.glb"),
+                error: Some("archive read failed".to_owned()),
+                material_error: None,
+            },
+        ];
+
+        assert_eq!(mesh_export_batch_outcome_counts(&outcomes), (1, 1));
+    }
+
+    #[test]
+    fn batch_progress_should_report_first_last_and_each_hundredth_job() {
+        let positions = (1..=250)
+            .filter(|position| should_report_batch_progress(*position, 250))
+            .collect::<Vec<_>>();
+
+        assert_eq!(positions, vec![1, 100, 200, 250]);
+    }
+
+    #[test]
+    fn cr2w_serialize_batch_manifest_should_parse_resource_and_output_jobs() {
+        let manifest: Cr2wSerializeBatchManifest = serde_json::from_str(
+            r#"{"jobs":[{"resource":"base\\worlds\\tile.streamingsector","output":"cache/tile.streamingsector.json"}]}"#,
+        )
+        .expect("fixture manifest should parse");
+
+        assert_eq!(
+            manifest.jobs,
+            vec![Cr2wSerializeBatchJob {
+                resource: r"base\worlds\tile.streamingsector".to_owned(),
+                output: PathBuf::from("cache/tile.streamingsector.json"),
+            }]
+        );
+    }
+
+    #[test]
+    fn atomic_json_writer_should_create_parents_and_replace_existing_output() {
+        let workspace = tempfile::tempdir().expect("temporary directory should be available");
+        let output = workspace.path().join("nested").join("record.json");
+        fs::create_dir_all(output.parent().expect("output should have a parent"))
+            .expect("fixture parent should be created");
+        fs::write(&output, b"stale").expect("fixture output should be written");
+
+        write_json_atomic(&output, &serde_json::json!({"fresh": true}))
+            .expect("atomic JSON write should succeed");
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                &fs::read(output).expect("output should be readable")
+            )
+            .expect("output should contain valid JSON"),
+            serde_json::json!({"fresh": true})
+        );
+    }
 }

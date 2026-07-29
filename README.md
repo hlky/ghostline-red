@@ -189,6 +189,55 @@ Serialize binary CR2W to recursive WKit-shaped JSON:
   --schema '.\red-schema.json'
 ```
 
+For archive-backed staging, serialize many depot resources while opening the
+game archive index only once. The manifest schema is:
+
+```json
+{
+  "jobs": [
+    {
+      "resource": "base\\worlds\\03_night_city\\_compiled\\default\\example.streamingsector",
+      "output": "C:\\world-cache\\example.streamingsector.json"
+    }
+  ]
+}
+```
+
+Run it with:
+
+```powershell
+& $red cr2w-serialize-batch '.\serialize-jobs.json' `
+  --schema '.\red-schema.json' `
+  --archives-root 'H:\Cyberpunk 2077\archive\pc' `
+  --report '.\serialize-report.json' `
+  --threads 8
+```
+
+The exact CLI shape is
+`cr2w-serialize-batch <MANIFEST> --schema <SCHEMA>... --archives-root
+<ARCHIVES_ROOT> --report <REPORT> [--threads <THREADS>]`. Repeat `--schema`
+to merge schema sources in increasing precedence order. `--threads 0` is the
+default and uses every available logical CPU.
+
+Every output is pretty JSON written through a temporary file in its destination
+directory, then atomically replaced. Missing parent directories are created.
+Jobs continue independently after errors, and the report preserves manifest
+order:
+
+```json
+[
+  {
+    "resource": "base\\worlds\\03_night_city\\_compiled\\default\\example.streamingsector",
+    "output": "C:\\world-cache\\example.streamingsector.json",
+    "error": null
+  }
+]
+```
+
+Failed jobs contain their error chain in `error`; successful jobs contain
+`null`. The command writes the complete report and exits nonzero when any job
+fails.
+
 Deserialize JSON using an existing same-kind CR2W resource as its audited
 layout template:
 
@@ -267,6 +316,11 @@ mesh appearance from a manifest:
 }
 ```
 
+Omit `appearance` to export a Blender material sidecar containing every mesh
+appearance. This is useful for world-sector projects where the same mesh is
+instanced with several appearances. PBR baking still requires one explicit
+appearance per job.
+
 ```powershell
 & $red mesh-export-batch '.\jobs.json' `
   --schema '.\red-schema.json' `
@@ -277,11 +331,34 @@ mesh appearance from a manifest:
 ```
 
 The batch continues after individual failures and records each outcome in the
-report. Jobs run concurrently through a shared archive index. Use `--threads`
-to choose the worker count; zero (the default) uses every available logical
-CPU. Shared dependency and PBR-cache writes are locked per resource, so
-unrelated work remains parallel while duplicate material references are
-deduplicated safely.
+report. A non-PBR material-sidecar failure does not discard a successfully
+exported GLB: `error` remains `null`, `material_error` contains the warning,
+and any stale or partially written `.Material.json` is removed. Archive reads,
+mesh decoding, and GLB writes remain fatal in `error`. With `--pbr`, material
+export and PBR baking are also fatal because the requested GLB is incomplete.
+For example:
+
+```json
+{
+  "mesh": "base\\worlds\\example.mesh",
+  "appearance": null,
+  "output": "C:\\catalog\\example.glb",
+  "error": null,
+  "material_error": "failed to export material sidecar: malformed material data"
+}
+```
+
+The command exits nonzero only when at least one report row has a fatal
+`error`; material warnings are counted separately in the completion summary.
+Progress output is bounded for large manifests: it reports the first, last,
+and each hundredth completion, plus the first fatal error and first material
+warning. The complete per-job diagnostics remain in the report.
+
+Jobs run concurrently through a shared archive index. Use `--threads` to
+choose the worker count; zero (the default) uses every available logical CPU.
+Shared dependency and PBR-cache writes are locked per resource, so unrelated
+work remains parallel while duplicate material references are deduplicated
+safely.
 
 An already exported GLB and sidecar can be upgraded independently:
 

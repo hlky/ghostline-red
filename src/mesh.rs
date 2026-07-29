@@ -148,15 +148,15 @@ fn decode_meshes(document: &Value, lod_filter: bool) -> Result<Vec<RawMesh>, Mes
     let header = member(render_blob, "header")?;
     let render_buffer = string_member(member(render_blob, "renderBuffer")?, "Bytes")?;
     let render_buffer = STANDARD.decode(render_buffer)?;
-    let quantization_scale = vector4(member(header, "quantizationScale")?)?;
-    let quantization_offset = vector4(member(header, "quantizationOffset")?)?;
+    let quantization_scale = quantization_vector(member(header, "quantizationScale")?)?;
+    let quantization_offset = quantization_vector(member(header, "quantizationOffset")?)?;
     let index_buffer_offset = usize_member(header, "indexBufferOffset")?;
     let appearances = decode_appearances(root)?;
     let chunks = array_member(header, "renderChunkInfos")?;
     let mut meshes = Vec::with_capacity(chunks.len());
 
     for (chunk_index, chunk) in chunks.iter().enumerate() {
-        let lod = u64_member(chunk, "lodMask")?;
+        let lod = u64_member_or_default(chunk, "lodMask")?;
         if lod_filter && lod != 1 {
             continue;
         }
@@ -286,8 +286,8 @@ fn decode_positions(
     offset: usize,
     stride: usize,
     count: usize,
-    scale: [f32; 4],
-    translation: [f32; 4],
+    scale: [f32; 3],
+    translation: [f32; 3],
 ) -> Result<Vec<[f32; 3]>, MeshError> {
     let mut result = Vec::with_capacity(count);
     for index in 0..count {
@@ -587,6 +587,14 @@ fn u64_member(value: &Value, name: &str) -> Result<u64, MeshError> {
         .ok_or_else(|| malformed(format!("{name} is not an unsigned integer")))
 }
 
+fn u64_member_or_default(value: &Value, name: &str) -> Result<u64, MeshError> {
+    value.get(name).map_or(Ok(0), |member| {
+        member
+            .as_u64()
+            .ok_or_else(|| malformed(format!("{name} is not an unsigned integer")))
+    })
+}
+
 fn usize_array(value: &Value) -> Result<Vec<usize>, MeshError> {
     value
         .as_array()
@@ -604,18 +612,14 @@ fn usize_array(value: &Value) -> Result<Vec<usize>, MeshError> {
     clippy::cast_possible_truncation,
     reason = "RED Vector4 components are stored as 32-bit floats and JSON exposes them as f64"
 )]
-fn vector4(value: &Value) -> Result<[f32; 4], MeshError> {
-    ["X", "Y", "Z", "W"]
-        .map(|name| {
-            member(value, name)?
-                .as_f64()
-                .map(|number| number as f32)
-                .ok_or_else(|| malformed(format!("{name} is not a number")))
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?
-        .try_into()
-        .map_err(|_| malformed("invalid Vector4"))
+fn quantization_vector(value: &Value) -> Result<[f32; 3], MeshError> {
+    let component = |name| {
+        member(value, name)?
+            .as_f64()
+            .map(|number| number as f32)
+            .ok_or_else(|| malformed(format!("{name} is not a number")))
+    };
+    Ok([component("X")?, component("Y")?, component("Z")?])
 }
 
 fn red_string(value: &Value) -> Result<String, MeshError> {
@@ -698,7 +702,10 @@ fn malformed(reason: impl Into<String>) -> MeshError {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_dec4, encode_glb, material_for_chunk, normalize};
+    use super::{
+        decode_dec4, encode_glb, material_for_chunk, normalize, quantization_vector,
+        u64_member_or_default,
+    };
     use serde_json::json;
 
     #[test]
@@ -733,5 +740,25 @@ mod tests {
         let result = encode_glb(&json!({"asset": {"version": "2.0"}}), &[]).unwrap();
 
         assert_eq!(&result[..8], b"glTF\x02\0\0\0");
+    }
+
+    #[test]
+    fn u64_member_or_default_returns_zero_for_omitted_red_property() {
+        let value = json!({"$type": "rendChunk"});
+
+        assert_eq!(u64_member_or_default(&value, "lodMask").unwrap(), 0);
+    }
+
+    #[test]
+    fn quantization_vector_ignores_unused_non_numeric_w_component() {
+        let value = json!({"$type": "Vector4", "X": 0.5, "Y": 1.0, "Z": 1.5, "W": null});
+        let decoded = quantization_vector(&value).unwrap();
+
+        assert!(
+            decoded
+                .iter()
+                .zip([0.5, 1.0, 1.5])
+                .all(|(actual, expected)| (*actual - expected).abs() < f32::EPSILON)
+        );
     }
 }

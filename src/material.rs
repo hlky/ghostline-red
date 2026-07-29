@@ -189,13 +189,27 @@ pub fn export_mesh_materials(
     appearance: Option<&str>,
 ) -> Result<ExportSummary, MaterialError> {
     let mesh = codec::decode_wkit_with_red_schema(mesh_input, schema, kraken_path)?;
+    let embedded_resources = embedded_resource_documents(&mesh)?;
     let root = path(&mesh, &["Data", "RootChunk"])?;
     let entries = array(root, "materialEntries")?;
-    let embedded = path(root, &["localMaterialBuffer", "rawData"])?;
-    let embedded_bytes = STANDARD.decode(string(embedded, "Bytes")?)?;
-    let headers = array(path(root, &["localMaterialBuffer"])?, "rawDataHeaders")?;
+    let local_buffer = root.get("localMaterialBuffer");
+    let embedded_bytes = local_buffer
+        .and_then(|buffer| buffer.get("rawData"))
+        .and_then(|raw_data| raw_data.get("Bytes"))
+        .and_then(Value::as_str)
+        .map(|bytes| STANDARD.decode(bytes))
+        .transpose()?
+        .unwrap_or_default();
+    let headers = local_buffer
+        .and_then(|buffer| buffer.get("rawDataHeaders"))
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
     let external = root
         .get("externalMaterials")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    let preloaded_external = root
+        .get("preloadExternalMaterials")
         .and_then(Value::as_array)
         .map_or(&[][..], Vec::as_slice);
     let all_appearances = decode_appearances(root)?;
@@ -233,30 +247,42 @@ pub fn export_mesh_materials(
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            let header = headers
-                .get(index)
-                .ok_or_else(|| malformed("local material index is outside the header table"))?;
-            let offset = usize_value(header.get("offset").unwrap_or(&Value::Null)).unwrap_or(0);
-            let size = usize_value(
-                header
-                    .get("size")
-                    .ok_or_else(|| malformed("local material header has no size"))?,
-            )
-            .ok_or_else(|| malformed("local material size is invalid"))?;
-            let end = offset
-                .checked_add(size)
-                .ok_or_else(|| malformed("local material byte range overflows"))?;
-            decode_bytes(
-                embedded_bytes
-                    .get(offset..end)
-                    .ok_or_else(|| malformed("local material byte range is outside the buffer"))?,
-                schema,
-                kraken_path,
-            )?
+            if let Some(header) = headers.get(index) {
+                let offset = usize_value(header.get("offset").unwrap_or(&Value::Null)).unwrap_or(0);
+                let size = usize_value(
+                    header
+                        .get("size")
+                        .ok_or_else(|| malformed("local material header has no size"))?,
+                )
+                .ok_or_else(|| malformed("local material size is invalid"))?;
+                let end = offset
+                    .checked_add(size)
+                    .ok_or_else(|| malformed("local material byte range overflows"))?;
+                decode_bytes(
+                    embedded_bytes.get(offset..end).ok_or_else(|| {
+                        malformed("local material byte range is outside the buffer")
+                    })?,
+                    schema,
+                    kraken_path,
+                )?
+            } else {
+                let preloaded = root
+                    .get("preloadLocalMaterialInstances")
+                    .and_then(Value::as_array)
+                    .and_then(|materials| materials.get(index))
+                    .and_then(|material| material.get("Data"))
+                    .ok_or_else(|| {
+                        malformed(
+                            "local material index is outside both the buffer and preload table",
+                        )
+                    })?;
+                json!({"Data": {"RootChunk": preloaded}})
+            }
         } else {
             let depot_path = external
                 .get(index)
-                .ok_or_else(|| malformed("external material index is outside the table"))
+                .or_else(|| preloaded_external.get(index))
+                .ok_or_else(|| malformed("external material index is outside both material tables"))
                 .and_then(red_depot_path)?;
             decode_bytes(
                 &archives.read_resource(&depot_path, kraken_path)?,
@@ -289,8 +315,13 @@ pub fn export_mesh_materials(
     for material in &materials {
         collect_depot_paths(&Value::Object(material.data.clone()), &mut queue);
     }
-    let mut dependency_exporter =
-        DependencyExporter::new(archives, schema, repository, kraken_path);
+    let mut dependency_exporter = DependencyExporter::new(
+        archives,
+        schema,
+        repository,
+        kraken_path,
+        &embedded_resources,
+    );
     dependency_exporter.export(queue)?;
 
     if let Some(parent) = sidecar.parent() {
@@ -337,6 +368,30 @@ pub fn export_mesh_materials(
     })
 }
 
+fn embedded_resource_documents(mesh: &Value) -> Result<HashMap<String, Value>, MaterialError> {
+    let mut resources = HashMap::new();
+    let Some(files) = mesh
+        .get("Data")
+        .and_then(|data| data.get("EmbeddedFiles"))
+        .and_then(Value::as_array)
+    else {
+        return Ok(resources);
+    };
+    for file in files {
+        let depot_path = file
+            .get("FileName")
+            .ok_or_else(|| malformed("embedded resource has no file name"))
+            .and_then(red_depot_path)?
+            .replace('/', "\\")
+            .to_lowercase();
+        let content = file
+            .get("Content")
+            .ok_or_else(|| malformed("embedded resource has no content"))?;
+        resources.insert(depot_path, json!({"Data": {"RootChunk": content}}));
+    }
+    Ok(resources)
+}
+
 fn resolve_material(
     name: String,
     document: &Value,
@@ -381,6 +436,11 @@ fn resolve_material(
         material_template = parent.material_template;
         enable_mask |= parent.enable_mask;
     }
+    if let Value::Object(defaults) = template_defaults(&material_template) {
+        for (key, value) in defaults {
+            data.entry(key).or_insert(value);
+        }
+    }
     if let Some(values) = root.get("values").and_then(Value::as_array) {
         for value in values {
             let object = value
@@ -411,7 +471,13 @@ fn decode_appearances(root: &Value) -> Result<Map<String, Value>, MaterialError>
             .map(red_string)
             .transpose()?
             .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("default{index}"));
+            .unwrap_or_else(|| {
+                if index == 0 {
+                    "default".to_owned()
+                } else {
+                    format!("default{index}")
+                }
+            });
         let materials = data
             .get("chunkMaterials")
             .and_then(Value::as_array)
@@ -429,6 +495,7 @@ struct DependencyExporter<'a> {
     schema: &'a RedSchema,
     repository: &'a Path,
     kraken_path: &'a OsStr,
+    embedded_resources: &'a HashMap<String, Value>,
     visited: HashSet<String>,
     textures: HashSet<String>,
     masks: usize,
@@ -440,12 +507,14 @@ impl<'a> DependencyExporter<'a> {
         schema: &'a RedSchema,
         repository: &'a Path,
         kraken_path: &'a OsStr,
+        embedded_resources: &'a HashMap<String, Value>,
     ) -> Self {
         Self {
             archives,
             schema,
             repository,
             kraken_path,
+            embedded_resources,
             visited: HashSet::new(),
             textures: HashSet::new(),
             masks: 0,
@@ -484,8 +553,13 @@ impl<'a> DependencyExporter<'a> {
                     collect_depot_paths(&document, &mut queue);
                     return Ok(());
                 }
-                let bytes = self.archives.read_resource(&normalized, self.kraken_path)?;
-                let mut document = decode_bytes(&bytes, self.schema, self.kraken_path)?;
+                let mut document = if let Some(embedded) = self.embedded_resources.get(&normalized)
+                {
+                    embedded.clone()
+                } else {
+                    let bytes = self.archives.read_resource(&normalized, self.kraken_path)?;
+                    decode_bytes(&bytes, self.schema, self.kraken_path)?
+                };
                 complete_blender_defaults(&mut document, extension)?;
                 match extension {
                     "xbm" => {

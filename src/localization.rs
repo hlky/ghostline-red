@@ -205,7 +205,11 @@ pub fn write_json(input: &Path, output: &Path) -> Result<(), LocalizationError> 
     let entries = read_entries(input)?;
     let document = serde_json::json!({
         "Header": {
-            "WolvenKitVersion": env!("CARGO_PKG_VERSION"),
+            "WolvenKitVersion": concat!(
+                "8.17-compatible (ghostline-red ",
+                env!("CARGO_PKG_VERSION"),
+                ")"
+            ),
             "WKitJsonVersion": "0.0.9",
             "GameVersion": 2310,
             "ExportedDateTime": "1970-01-01T00:00:00Z",

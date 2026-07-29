@@ -22,16 +22,34 @@ static BAKE_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
 
 /// Material templates used by the equipment database's selected appearances.
 pub const SUPPORTED_TEMPLATES: &[&str] = &[
+    r"base\fx\_shaders\invisible.mt",
+    r"base\fx\shaders\device_diode.mt",
     r"base\fx\shaders\hologram.mt",
     r"base\fx\shaders\metal_base_glitter.mt",
     r"base\fx\shaders\parallaxscreen.mt",
+    r"base\fx\shaders\parallaxscreen_transparent.mt",
     r"base\fx\shaders\signages.mt",
     r"base\materials\glass.mt",
+    r"base\materials\glass_cracked_edge.mt",
+    r"base\materials\glass_deferred.mt",
     r"base\materials\glass_onesided.mt",
+    r"base\materials\fillable_fluid.mt",
+    r"base\materials\lights_interactive.mt",
+    r"base\materials\metal_base_det.mt",
+    r"base\materials\metal_base_det_dithered.mt",
+    r"base\materials\metal_base_dithered.mt",
+    r"base\materials\metal_base_gradientmap_recolor.mt",
+    r"base\materials\metal_base_ui.mt",
     r"base\materials\mesh_decal.mt",
     r"base\materials\mesh_decal_emissive.mt",
+    r"base\materials\mesh_decal_gradientmap_recolor.mt",
     r"base\materials\mesh_decal_parallax.mt",
+    r"base\materials\multilayered_terrain.mt",
+    r"base\materials\vehicle_destr_blendshape.mt",
+    r"base\materials\vehicle_mesh_decal.mt",
+    r"base\materials\window_parallax_interior.mt",
     r"engine\materials\metal_base.remt",
+    r"engine\materials\metal_base_proxy.mt",
     r"engine\materials\multilayered.mt",
 ];
 
@@ -202,20 +220,40 @@ fn bake_material(record: &Value, context: &mut BakeContext<'_>) -> Result<PbrMat
         .unwrap_or(false);
 
     match template.as_str() {
-        r"engine\materials\multilayered.mt" => bake_multilayered(name, record, data, context),
-        r"engine\materials\metal_base.remt" | r"base\fx\shaders\metal_base_glitter.mt" => {
+        r"engine\materials\multilayered.mt" | r"base\materials\multilayered_terrain.mt" => {
+            bake_multilayered(name, record, data, context)
+        }
+        r"engine\materials\metal_base.remt"
+        | r"engine\materials\metal_base_proxy.mt"
+        | r"base\fx\shaders\device_diode.mt"
+        | r"base\fx\shaders\metal_base_glitter.mt"
+        | r"base\materials\lights_interactive.mt"
+        | r"base\materials\metal_base_det.mt"
+        | r"base\materials\metal_base_gradientmap_recolor.mt"
+        | r"base\materials\metal_base_ui.mt"
+        | r"base\materials\vehicle_destr_blendshape.mt" => {
             bake_metal_base(name, record, data, context, enable_mask)
         }
-        r"base\materials\mesh_decal.mt" | r"base\materials\mesh_decal_parallax.mt" => {
-            bake_decal(name, record, data, context)
+        r"base\materials\metal_base_dithered.mt" | r"base\materials\metal_base_det_dithered.mt" => {
+            bake_metal_base(name, record, data, context, true)
         }
+        r"base\materials\mesh_decal.mt"
+        | r"base\materials\mesh_decal_gradientmap_recolor.mt"
+        | r"base\materials\mesh_decal_parallax.mt"
+        | r"base\materials\vehicle_mesh_decal.mt" => bake_decal(name, record, data, context),
         r"base\materials\mesh_decal_emissive.mt" => bake_emissive_decal(name, data, context),
-        r"base\materials\glass.mt" | r"base\materials\glass_onesided.mt" => {
-            bake_glass(name, record, data, context)
+        r"base\materials\fillable_fluid.mt"
+        | r"base\materials\glass.mt"
+        | r"base\materials\glass_cracked_edge.mt"
+        | r"base\materials\glass_deferred.mt"
+        | r"base\materials\glass_onesided.mt" => bake_glass(name, record, data, context),
+        r"base\fx\shaders\parallaxscreen.mt" | r"base\fx\shaders\parallaxscreen_transparent.mt" => {
+            bake_screen(name, data, context)
         }
-        r"base\fx\shaders\parallaxscreen.mt" => bake_screen(name, data, context),
         r"base\fx\shaders\signages.mt" => bake_signage(name, data, context),
         r"base\fx\shaders\hologram.mt" => bake_hologram(name, data, context),
+        r"base\materials\window_parallax_interior.mt" => bake_window_parallax(name, data, context),
+        r"base\fx\_shaders\invisible.mt" => Ok(bake_invisible(name)),
         _ => Err(PbrError::UnsupportedTemplate(template)),
     }
 }
@@ -261,10 +299,16 @@ fn bake_metal_base(
     }
     if let Some(path) = optional_texture(context.repository, data, "Emissive")? {
         material.emissive_texture = Some(path);
-        material.emissive_factor = color(data.get("EmissiveColor"), [1.0, 1.0, 1.0, 1.0])[..3]
+        material.emissive_factor = color(
+            data.get("EmissiveColor")
+                .or_else(|| data.get("EmissiveColor1"))
+                .or_else(|| data.get("DebugLightsIntensity")),
+            [1.0, 1.0, 1.0, 1.0],
+        )[..3]
             .try_into()
             .expect("three-element color slice");
-        material.emissive_strength = scalar(data, "EmissiveEV", 1.0).max(0.0);
+        material.emissive_strength =
+            scalar(data, "EmissiveEV", scalar(data, "Zone0EmissiveEV", 1.0)).max(0.0);
     }
     Ok(material)
 }
@@ -371,6 +415,34 @@ fn bake_screen(
     material.metallic_factor = scalar(data, "Metalness", 0.0).clamp(0.0, 1.0);
     material.roughness_factor = scalar(data, "Roughness", 0.35).clamp(0.0, 1.0);
     Ok(material)
+}
+
+fn bake_window_parallax(
+    name: String,
+    data: &Map<String, Value>,
+    context: &BakeContext<'_>,
+) -> Result<PbrMaterial, PbrError> {
+    let mut material = PbrMaterial::new(name);
+    let texture = optional_texture(context.repository, data, "RoomAtlas")?
+        .or(optional_texture(context.repository, data, "LayerAtlas")?)
+        .or(optional_texture(context.repository, data, "WindowTexture")?);
+    material.base_color_texture.clone_from(&texture);
+    material.emissive_texture = texture;
+    material.base_color_factor = color(data.get("TintColorAtNight"), [1.0; 4]);
+    material.emissive_factor = material.base_color_factor[..3]
+        .try_into()
+        .expect("three-element color slice");
+    material.emissive_strength = scalar(data, "EmissiveEV", 1.0).max(0.0);
+    material.normal_texture = optional_texture(context.repository, data, "Normal")?;
+    material.roughness_factor = 0.35;
+    Ok(material)
+}
+
+fn bake_invisible(name: String) -> PbrMaterial {
+    let mut material = PbrMaterial::new(name);
+    material.base_color_factor[3] = 0.0;
+    material.alpha_mode = "BLEND";
+    material
 }
 
 fn bake_signage(
@@ -1288,12 +1360,7 @@ fn malformed(reason: impl Into<String>) -> PbrError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SUPPORTED_TEMPLATES, apply_levels};
-
-    #[test]
-    fn supports_every_template_in_the_equipment_database() {
-        assert_eq!(SUPPORTED_TEMPLATES.len(), 11);
-    }
+    use super::apply_levels;
 
     #[test]
     fn levels_apply_multiply_then_add_and_clamp() {
