@@ -567,7 +567,7 @@ impl Encoder<'_> {
             let Some(schema_property) = class_property(self.schema, red_type, property) else {
                 continue;
             };
-            let Some(property_type) = red_type_from_cs(&schema_property.cs_type) else {
+            let Some(property_type) = self.property_type(schema_property) else {
                 continue;
             };
             if is_default_missing_value(property_value, &property_type) {
@@ -660,6 +660,9 @@ impl Encoder<'_> {
             "TweakDBID" => Ok(tweak_db_id(storage_or_string(value)?)?
                 .to_le_bytes()
                 .to_vec()),
+            "LocalizationString" | "gamedataLocKeyWrapper" => self
+                .encode_value(value, red_type, 0, 0, &mut HashMap::new())
+                .map(|(bytes, _)| bytes),
             _ if red_type.starts_with("array:") => {
                 let values = value.as_array().ok_or_else(|| unsupported("array value"))?;
                 let inner = &red_type[6..];
@@ -672,6 +675,10 @@ impl Encoder<'_> {
                 }
                 Ok(output)
             }
+            _ if red_type.starts_with("rRef:") || red_type.starts_with("raRef:") => self
+                .encode_value(value, red_type, 0, 0, &mut HashMap::new())
+                .map(|(bytes, _)| bytes),
+            _ if self.classes.contains(red_type) => self.encode_new_class(value, red_type),
             _ if value.is_string() => Ok(self
                 .name_index(normalize_wolvenkit_enum_name(
                     value
@@ -684,6 +691,73 @@ impl Encoder<'_> {
                 "cannot synthesize missing property type {red_type}"
             ))),
         }
+    }
+
+    fn encode_new_class(&self, value: &Value, red_type: &str) -> Result<Vec<u8>, WriterError> {
+        let object = value
+            .as_object()
+            .ok_or_else(|| unsupported(format!("{red_type} is not an object")))?;
+        let mut properties = Vec::new();
+        for (name, value) in object {
+            if name == "$type" {
+                continue;
+            }
+            if is_default_missing_value(value, "") {
+                continue;
+            }
+            let property = class_property(self.schema, red_type, name)
+                .ok_or_else(|| unsupported(format!("unknown property {red_type}.{name}")))?;
+            let property_type = self
+                .property_type(property)
+                .ok_or_else(|| unsupported(format!("unsupported property {red_type}.{name}")))?;
+            if is_default_missing_value(value, &property_type) {
+                continue;
+            }
+            let payload = self.encode_new_value(value, &property_type)?;
+            properties.push((
+                property.ordinal.unwrap_or(u32::MAX),
+                encode_property(
+                    self.name_index(name)?,
+                    self.name_index(&property_type)?,
+                    &payload,
+                )?,
+            ));
+        }
+        properties.sort_by_key(|(ordinal, _)| *ordinal);
+        let mut output = vec![0];
+        for (_, property) in properties {
+            output.extend_from_slice(&property);
+        }
+        output.extend_from_slice(&0_u16.to_le_bytes());
+        Ok(output)
+    }
+
+    fn property_type(&self, property: &schema::RedProperty) -> Option<String> {
+        property
+            .red_type
+            .clone()
+            .or_else(|| self.schema_type(&property.cs_type))
+    }
+
+    fn schema_type(&self, cs_type: &str) -> Option<String> {
+        if let Some(red_type) = red_type_from_cs(cs_type) {
+            return Some(red_type);
+        }
+        for (prefix, red_prefix) in [
+            ("CArray<", "array:"),
+            ("CResourceReference<", "rRef:"),
+            ("CResourceAsyncReference<", "raRef:"),
+        ] {
+            if let Some(inner) = cs_type
+                .strip_prefix(prefix)
+                .and_then(|inner| inner.strip_suffix('>'))
+            {
+                return self
+                    .schema_type(inner)
+                    .map(|inner| format!("{red_prefix}{inner}"));
+            }
+        }
+        self.classes.contains(cs_type).then(|| cs_type.to_owned())
     }
 
     fn encode_device_data_appendix(
@@ -1198,19 +1272,37 @@ impl Encoder<'_> {
         if cursor != template_end {
             return Err(unsupported("array template trailing bytes"));
         }
-        if !values.is_empty() && element_templates.is_empty() {
-            return Err(unsupported("cannot grow an empty template array"));
-        }
+        let handles = inner.starts_with("handle:") || inner.starts_with("whandle:");
         if values.len() > element_templates.len()
-            && !(inner.starts_with("handle:") || inner.starts_with("whandle:"))
+            && !(fixed_size(inner).is_some()
+                || matches!(inner, "String" | "NodeRef" | "LocalizationString")
+                || self.classes.contains(inner)
+                || self.enums.is_some_and(|enums| enums.contains(inner))
+                || self
+                    .bitfields
+                    .is_some_and(|bitfields| bitfields.contains(inner))
+                || inner.starts_with("array:")
+                || inner.starts_with("curveData:")
+                || inner.starts_with("multiChannelCurve:"))
         {
-            return Err(unsupported("cannot grow a template handle array"));
+            return Err(unsupported(format!(
+                "cannot grow array of unsupported type {inner}"
+            )));
+        }
+        if !values.is_empty() && element_templates.is_empty() {
+            if handles {
+                return Err(unsupported("cannot grow an empty template handle array"));
+            }
+            return Ok((
+                self.encode_new_value(value, &format!("array:{inner}"))?,
+                template_end,
+            ));
         }
         let mut output = u32::try_from(values.len())
             .map_err(|_| WriterError::TooLarge)?
             .to_le_bytes()
             .to_vec();
-        let encoded_values = if self.discovering_handles.get() {
+        let encoded_values = if self.discovering_handles.get() && handles {
             for value in values.iter().skip(element_templates.len()) {
                 collect_handle_ids(value, &mut self.candidate_handles.borrow_mut());
             }
@@ -1799,6 +1891,13 @@ fn red_type_from_cs(cs_type: &str) -> Option<String> {
 }
 
 fn is_default_missing_value(value: &Value, red_type: &str) -> bool {
+    if (red_type.starts_with("rRef:") || red_type.starts_with("raRef:"))
+        && value.pointer("/DepotPath/$value").and_then(Value::as_str) == Some("0")
+    {
+        // A null import has no on-disk flags. Keep the owning class's
+        // constructor defaults, just as WolvenKit's writer does.
+        return true;
+    }
     if value.is_null()
         || value.as_bool() == Some(false)
         || value.as_i64() == Some(0)
@@ -3167,8 +3266,8 @@ fn normalize_wolvenkit_enum_name(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::{
-        area_shape_outline_buffer, buffer_matches, channel_link_type_value, class_property,
-        collect_handle_ids, compact_export_indices, encode_device_data_entry,
+        Encoder, area_shape_outline_buffer, buffer_matches, channel_link_type_value,
+        class_property, collect_handle_ids, compact_export_indices, encode_device_data_entry,
         encode_string_with_template, handle_identity, interpolation_type_value,
         is_default_missing_value, json_bool, json_f32, node_ref_value,
         normalize_wolvenkit_enum_name, read_json, red_type_from_cs, redpackage_ordinal_map,
@@ -3178,12 +3277,182 @@ mod tests {
     use crate::{codec, cr2w, kraken, schema};
     use serde_json::{Value, json};
     use std::{
+        cell::{Cell, RefCell},
         collections::{BTreeMap, BTreeSet, HashMap, HashSet},
         env,
         ffi::OsStr,
         fs,
         path::PathBuf,
     };
+
+    fn with_test_encoder<T>(
+        template: &[u8],
+        classes: &BTreeMap<String, schema::RedClass>,
+        test: impl FnOnce(&Encoder<'_>) -> T,
+    ) -> T {
+        let names = ["None", "id", "CRUID", "voicetagId", "scnVoicetagId"];
+        let file = cr2w::Cr2wInspection {
+            header: cr2w::Cr2wHeader {
+                version: 195,
+                flags: 0,
+                timestamp: 0,
+                build_version: 0,
+                objects_end: 0,
+                buffers_end: 0,
+                crc32: 0,
+                chunk_count: 0,
+                tables: vec![],
+            },
+            strings: vec![],
+            names: names
+                .iter()
+                .map(|name| cr2w::Cr2wName {
+                    value: (*name).to_owned(),
+                    hash: 0,
+                })
+                .collect(),
+            imports: vec![],
+            exports: vec![],
+            buffers: vec![],
+            embedded: vec![],
+        };
+        let class_names = classes.keys().cloned().collect();
+        let encoder = Encoder {
+            template,
+            file: &file,
+            names: RefCell::new(
+                names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| ((*name).to_owned(), u16::try_from(index).unwrap()))
+                    .collect(),
+            ),
+            new_names: RefCell::new(vec![]),
+            imports: RefCell::new(HashMap::new()),
+            new_imports: RefCell::new(vec![]),
+            used_imports: RefCell::new(HashSet::new()),
+            handle_exports: RefCell::new(HashMap::new()),
+            export_remap: RefCell::new(HashMap::new()),
+            claimed_exports: RefCell::new(HashSet::new()),
+            candidate_handles: RefCell::new(HashSet::new()),
+            discovering_handles: Cell::new(false),
+            classes: &class_names,
+            schema: classes,
+            enums: None,
+            bitfields: None,
+        };
+        test(&encoder)
+    }
+
+    #[test]
+    fn missing_nested_voicetag_is_written_instead_of_silently_dropped() {
+        let classes = serde_json::from_value(json!({
+            "scnActorDef": {"base": null, "properties": {"voicetagId": {"cs_type": "scnVoicetagId", "ordinal": 1}}},
+            "scnVoicetagId": {"base": null, "properties": {"id": {"cs_type": "CRUID", "ordinal": 0}}}
+        })).unwrap();
+        with_test_encoder(&[0, 0, 0], &classes, |encoder| {
+            let authored = json!({"$type": "scnActorDef", "voicetagId": {"$type": "scnVoicetagId", "id": "18446744073709551615"}});
+            let (bytes, consumed) = encoder
+                .encode_class(&authored, 0, 3, "scnActorDef", &mut HashMap::new())
+                .unwrap();
+            assert_eq!(consumed, 3);
+            assert_eq!(
+                bytes,
+                [
+                    0, 3, 0, 4, 0, 23, 0, 0, 0, 0, 1, 0, 2, 0, 12, 0, 0, 0, 255, 255, 255, 255,
+                    255, 255, 255, 255, 0, 0, 0, 0
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn lipmap_voice_tag_array_grows_without_a_handle_template() {
+        let template = [1, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+        with_test_encoder(&template, &BTreeMap::new(), |encoder| {
+            let (bytes, consumed) = encoder
+                .encode_array(
+                    &json!(["7", "18446744073709551615"]),
+                    "CRUID",
+                    0,
+                    template.len(),
+                    &mut HashMap::new(),
+                )
+                .unwrap();
+            assert_eq!(consumed, template.len());
+            assert_eq!(
+                bytes,
+                [
+                    2, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn empty_lipmap_resource_array_registers_new_imports() {
+        with_test_encoder(&[0, 0, 0, 0], &BTreeMap::new(), |encoder| {
+            let refs = json!([
+                {"DepotPath": {"$value": "mod\\first.anims"}, "Flags": "Soft"},
+                {"DepotPath": {"$value": "mod\\second.anims"}, "Flags": "Soft"}
+            ]);
+            let (bytes, _) = encoder
+                .encode_array(&refs, "raRef:animAnimSet", 0, 4, &mut HashMap::new())
+                .unwrap();
+            assert_eq!(bytes, [2, 0, 0, 0, 1, 0, 2, 0]);
+            assert_eq!(encoder.new_imports.borrow().len(), 2);
+            assert!(encoder.used_imports.borrow().contains("mod\\second.anims"));
+        });
+    }
+
+    #[test]
+    fn empty_handle_array_still_requires_an_export_template() {
+        with_test_encoder(&[0, 0, 0, 0], &BTreeMap::new(), |encoder| {
+            let error = encoder
+                .encode_array(
+                    &json!([{"HandleRefId": "1"}]),
+                    "handle:scnSceneResource",
+                    0,
+                    4,
+                    &mut HashMap::new(),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("empty template handle array"));
+        });
+    }
+
+    #[test]
+    fn unknown_array_growth_cannot_silently_duplicate_opaque_template_bytes() {
+        with_test_encoder(&[1, 0, 0, 0, 9, 0], &BTreeMap::new(), |encoder| {
+            let error = encoder
+                .encode_array(
+                    &json!(["first", "second"]),
+                    "UnknownType",
+                    0,
+                    6,
+                    &mut HashMap::new(),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("unsupported type UnknownType"));
+        });
+    }
+
+    #[test]
+    fn empty_voice_tag_array_can_be_populated() {
+        with_test_encoder(&[0, 0, 0, 0], &BTreeMap::new(), |encoder| {
+            let (bytes, consumed) = encoder
+                .encode_array(
+                    &json!(["18446744073709551615"]),
+                    "Uint64",
+                    0,
+                    4,
+                    &mut HashMap::new(),
+                )
+                .unwrap();
+            assert_eq!(consumed, 4);
+            assert_eq!(bytes, [1, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255]);
+        });
+    }
 
     #[test]
     fn write_positive_vlq_encodes_single_and_multi_byte_counts() {
