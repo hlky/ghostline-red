@@ -89,6 +89,32 @@ diagnostic flags. Normal archive, CR2W, and LXRS paths always use the Rust
 implementation. Payloads that do not benefit from Rust compression are stored
 as ordinary uncompressed archive segments.
 
+## Archive compatibility checks
+
+Run the independent encoder test with the game's Oodle DLL. WolvenKit's
+replacement `kraken.dll` can accept streams that the game's decoder rejects,
+so it is not sufficient as the sole encoder oracle.
+
+```powershell
+$env:OODLE_DLL = 'C:\path\to\oo2ext_7_win64.dll'
+cargo test --release --test kraken_oodle -- --ignored
+```
+
+Test historical archives by extracting with WolvenKit, packing the extracted
+tree with both tools, and extracting both candidates with WolvenKit:
+
+```powershell
+python scripts/archive_regression.py 'C:\builds\old.archive' `
+  --wolvenkit 'C:\Tools\WolvenKit\WolvenKit.CLI.exe' `
+  --red target/release/ghostline-red.exe --output '.tmp/archive-check-new'
+```
+
+The output directory must be new. `report.json` records archive sizes and
+results; each case retains command logs, indexes, and payload SHA-256 hashes.
+Checks require identical depot paths, entry hashes, logical segment layouts,
+and extracted payload bytes. Compression ratios, timestamps, physical offsets,
+and archive bytes can differ. These checks do not replace game startup testing.
+
 ## Clean-room Kraken commands
 
 Encode a compatible stream without a DLL:

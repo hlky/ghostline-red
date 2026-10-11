@@ -1,6 +1,6 @@
 //! Implements a DLL-free interoperable Oodle Kraken byte stream.
 //!
-//! Streams are divided into independent 256 KiB blocks. This module emits
+//! Streams are divided into 256 KiB blocks with continuing history. This module emits
 //! compatible raw, constant-byte, general Huffman, compact tANS, and
 //! deterministic LZ blocks. The decoder also accepts general old/new Huffman,
 //! tANS, RLE, recursive/indexed array composition, both LZ modes, and their
@@ -11,6 +11,8 @@ use thiserror::Error;
 
 const BLOCK_SIZE: usize = 256 * 1024;
 const CHUNK_SIZE: usize = 128 * 1024;
+// Short matches use 16-byte speculative copies in Oodle's decoder.
+const LZ_LITERAL_TAIL: usize = 16;
 const RAW_BLOCK_HEADER: [u8; 2] = [0xcc, 0x06];
 const COMPRESSED_BLOCK_HEADER: [u8; 2] = [0x8c, 0x06];
 const MEMSET_QUANTUM: [u8; 3] = [0x07, 0xff, 0xff];
@@ -71,19 +73,33 @@ pub fn encode(input: &[u8]) -> Vec<u8> {
             .len()
             .saturating_add(input.len().div_ceil(BLOCK_SIZE) * 2),
     );
-    for block in input.chunks(BLOCK_SIZE) {
+    for (index, block) in input.chunks(BLOCK_SIZE).enumerate() {
         if let Some(&value) = block.first()
             && block.iter().all(|byte| *byte == value)
         {
-            output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+            write_block_header(&mut output, false, index * BLOCK_SIZE);
             output.extend_from_slice(&MEMSET_QUANTUM);
             output.push(value);
         } else {
-            output.extend_from_slice(&RAW_BLOCK_HEADER);
+            write_block_header(&mut output, true, index * BLOCK_SIZE);
             output.extend_from_slice(block);
         }
     }
     output
+}
+
+fn write_block_header(output: &mut Vec<u8>, raw: bool, absolute_offset: usize) {
+    let mut header = if raw {
+        RAW_BLOCK_HEADER
+    } else {
+        COMPRESSED_BLOCK_HEADER
+    };
+    // Only the first block restarts history. Later LZ chunks omit the initial
+    // eight bytes and must not tell Oodle to reset its history window.
+    if absolute_offset != 0 {
+        header[0] &= 0x7f;
+    }
+    output.extend_from_slice(&header);
 }
 
 fn encode_greedy_lz_stream(input: &[u8]) -> Option<Vec<u8>> {
@@ -120,7 +136,7 @@ fn encode_greedy_lz_block(block: &[u8], absolute_offset: usize) -> Option<Vec<u8
         return None;
     }
     let mut output = Vec::with_capacity(quantum.len() + 5);
-    output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+    write_block_header(&mut output, false, absolute_offset);
     write_be24(
         &mut output,
         u32::try_from(quantum.len().checked_sub(1)?).ok()?,
@@ -165,7 +181,7 @@ fn encode_stable_distance_lz_chunk(chunk: &[u8], has_initial_history: bool) -> O
     let mut position = start;
     let mut literal_start = start;
     let mut first_match = true;
-    while position + 4 <= chunk.len() {
+    while position + 4 <= chunk.len().saturating_sub(LZ_LITERAL_TAIL) {
         if position < distance {
             position += 1;
             continue;
@@ -173,7 +189,7 @@ fn encode_stable_distance_lz_chunk(chunk: &[u8], has_initial_history: bool) -> O
         let match_length = common_prefix_length(
             &chunk[position - distance..],
             &chunk[position..],
-            chunk.len() - position,
+            chunk.len() - LZ_LITERAL_TAIL - position,
         );
         if match_length < 4 {
             position += 1;
@@ -239,7 +255,7 @@ fn encode_greedy_lz_chunk(chunk: &[u8], has_initial_history: bool) -> Option<Vec
     let mut recent = [8_usize; 3];
     let mut position = start;
     let mut literal_start = start;
-    while position + 4 <= chunk.len() {
+    while position + 4 <= chunk.len().saturating_sub(LZ_LITERAL_TAIL) {
         let (best_distance, best_length) = find_best_match(chunk, &previous, position, &recent)?;
         if best_length < 4 {
             position += 1;
@@ -331,7 +347,7 @@ fn find_best_match(
             let length = common_prefix_length(
                 &chunk[position - distance..],
                 &chunk[position..],
-                chunk.len() - position,
+                chunk.len() - LZ_LITERAL_TAIL - position,
             );
             if length > best.1 {
                 best = (distance, length);
@@ -343,8 +359,11 @@ fn find_best_match(
         let prior = usize::try_from(prior).ok()?;
         let distance = position - prior;
         if (8..=0x3fff).contains(&distance) {
-            let length =
-                common_prefix_length(&chunk[prior..], &chunk[position..], chunk.len() - position);
+            let length = common_prefix_length(
+                &chunk[prior..],
+                &chunk[position..],
+                chunk.len() - LZ_LITERAL_TAIL - position,
+            );
             if length > best.1 {
                 best = (distance, length);
             }
@@ -481,16 +500,16 @@ impl MsbBits {
 
 fn encode_huffman_stream(input: &[u8]) -> Option<Vec<u8>> {
     let mut output = Vec::new();
-    for block in input.chunks(BLOCK_SIZE) {
+    for (index, block) in input.chunks(BLOCK_SIZE).enumerate() {
         if let Some(&value) = block.first()
             && block.iter().all(|byte| *byte == value)
         {
-            output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+            write_block_header(&mut output, false, index * BLOCK_SIZE);
             output.extend_from_slice(&MEMSET_QUANTUM);
             output.push(value);
             continue;
         }
-        let encoded = encode_huffman_block(block)?;
+        let encoded = encode_huffman_block(block, index * BLOCK_SIZE)?;
         if encoded.len() >= block.len() + RAW_BLOCK_HEADER.len() {
             return None;
         }
@@ -499,7 +518,7 @@ fn encode_huffman_stream(input: &[u8]) -> Option<Vec<u8>> {
     Some(output)
 }
 
-fn encode_huffman_block(block: &[u8]) -> Option<Vec<u8>> {
+fn encode_huffman_block(block: &[u8], absolute_offset: usize) -> Option<Vec<u8>> {
     let mut quantum = Vec::new();
     for chunk in block.chunks(CHUNK_SIZE) {
         quantum.extend_from_slice(&encode_entropy_array(chunk)?);
@@ -508,7 +527,7 @@ fn encode_huffman_block(block: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut output = Vec::with_capacity(quantum.len() + 5);
-    output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+    write_block_header(&mut output, false, absolute_offset);
     write_be24(&mut output, u32::try_from(quantum.len() - 1).ok()?);
     output.extend_from_slice(&quantum);
     Some(output)
@@ -923,7 +942,7 @@ fn encode_period_eight_stream(input: &[u8]) -> Vec<u8> {
         if encoded_block.len() < block.len() + RAW_BLOCK_HEADER.len() {
             output.extend_from_slice(&encoded_block);
         } else {
-            output.extend_from_slice(&RAW_BLOCK_HEADER);
+            write_block_header(&mut output, true, absolute_offset);
             output.extend_from_slice(block);
         }
         absolute_offset += block.len();
@@ -970,7 +989,7 @@ fn encode_period_eight_block(block: &[u8], absolute_offset: usize) -> Vec<u8> {
     }
 
     let mut output = Vec::with_capacity(quantum.len() + 5);
-    output.extend_from_slice(&COMPRESSED_BLOCK_HEADER);
+    write_block_header(&mut output, false, absolute_offset);
     write_be24(
         &mut output,
         u32::try_from(quantum.len().saturating_sub(1)).unwrap_or(u32::MAX),
